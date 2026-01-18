@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.YOUR_PROJECT.ROLE</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>REPO_ROOT/agent_factory/run_orchestrator</string>
+      <string>--profile</string>
+      <string>REPO_ROOT/Agent_profiles/ROLE_PROFILE.md</string>
+      <string>--goal-file</string>
+      <string>REPO_ROOT/goal.md</string>
+      <string>--queue-dir</string>
+      <string>REPO_ROOT/tasks/QUEUE_DIR</string>
+      <string>--max</string>
+      <string>1</string>
+      <string>--once</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>REPO_ROOT</string>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>REPO_ROOT/logs/ROLE.out</string>
+    <key>StandardErrorPath</key>
+    <string>REPO_ROOT/logs/ROLE.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>AGENT_BIN</key>
+      <string>~/.local/bin/agent</string>
+      <key>PATH</key>
+      <string>~/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+  </dict>
+</plist>

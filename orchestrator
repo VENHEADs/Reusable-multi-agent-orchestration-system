@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: orchestrator --profile <path> [options]
+
+required:
+  --profile <path>           profile markdown file
+
+optional:
+  --agent-bin <path>         agent CLI path (default: from $AGENT_BIN or PATH)
+  --api-key <key>            Cursor API key (default: from $CURSOR_API_KEY)
+  --goal-file <path>         goal file (source of truth, prepended to all prompts)
+  --queue-dir <path>         consume task files from a queue directory
+  --max <n>                  max tasks per loop (default: 1)
+  --sleep <sec>              sleep between loops (default: 5)
+  --model <model>            model name passed to agent CLI
+  --fallback-model <model>   fallback model if rate limit hit (default: from $FALLBACK_MODEL or "claude-3-5-sonnet-20241022")
+  --once                     process up to --max tasks then exit (queue mode only)
+  --dry-run                  print commands without executing
+  -h, --help                 show help
+
+environment:
+  AGENT_BIN                  agent CLI path (e.g., ~/.local/bin/agent)
+  CURSOR_API_KEY             api key for authentication
+  FALLBACK_MODEL             fallback model name (default: "claude-3-5-sonnet-20241022")
+EOF
+}
+
+profile=""
+agent_bin="${AGENT_BIN:-}"
+api_key="${CURSOR_API_KEY:-}"
+goal_file=""
+queue_dir=""
+max_spawns="1"
+sleep_secs="5"
+model=""
+fallback_model="${FALLBACK_MODEL:-gpt-5.2-codex-low}"
+dry_run="0"
+once="0"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      profile="$2"
+      shift 2
+      ;;
+    --goal-file)
+      goal_file="$2"
+      shift 2
+      ;;
+    --queue-dir)
+      queue_dir="$2"
+      shift 2
+      ;;
+    --agent-bin)
+      agent_bin="$2"
+      shift 2
+      ;;
+    --api-key)
+      api_key="$2"
+      shift 2
+      ;;
+    --max)
+      max_spawns="$2"
+      shift 2
+      ;;
+    --sleep)
+      sleep_secs="$2"
+      shift 2
+      ;;
+    --model)
+      model="$2"
+      shift 2
+      ;;
+    --fallback-model)
+      fallback_model="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry_run="1"
+      shift
+      ;;
+    --once)
+      once="1"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$profile" ]]; then
+  echo "--profile is required" >&2
+  exit 2
+fi
+
+if [[ ! -f "$profile" ]]; then
+  echo "profile not found: $profile" >&2
+  exit 2
+fi
+
+if [[ -n "$goal_file" && ! -f "$goal_file" ]]; then
+  echo "goal file not found: $goal_file" >&2
+  exit 2
+fi
+
+if [[ -z "$agent_bin" ]]; then
+  agent_bin="$(command -v agent || true)"
+fi
+
+if [[ -z "$agent_bin" || ! -x "$agent_bin" ]]; then
+  echo "agent cli not found; set --agent-bin or AGENT_BIN" >&2
+  exit 2
+fi
+
+spawn_with_file() {
+  local prompt_file="$1"
+  local log_label="${2:-$(basename "$prompt_file")}"
+  log_label="${log_label//[^A-Za-z0-9_.-]/_}"
+  local tmp_prompt
+  tmp_prompt="$(mktemp)"
+  
+  # build prompt: goal file (if provided) + profile + task file
+  if [[ -n "$goal_file" ]]; then
+    {
+      echo "# GOAL FILE (Source of Truth - Check This First)"
+      echo ""
+      cat "$goal_file"
+      echo ""
+      echo "---"
+      echo ""
+    } >> "$tmp_prompt"
+  fi
+  cat "$prompt_file" >> "$tmp_prompt"
+  
+  local profile_content
+  profile_content="$(cat "$tmp_prompt")"
+  
+  if [[ "$dry_run" == "1" ]]; then
+    echo "$agent_bin --print --force --api-key '***' --workspace '$(pwd)' ${model:+--model $model }'<prompt from $tmp_prompt (includes goal file if provided)>'"
+    rm -f "$tmp_prompt"
+    return 0
+  fi
+  local run_ts
+  run_ts="$(date +%Y%m%d_%H%M%S)"
+  local log_dir
+  log_dir="$(pwd)/logs/agent_runs"
+  mkdir -p "$log_dir"
+  local log_file
+  log_file="$log_dir/${run_ts}_${log_label}.log"
+
+  # try with primary model first
+  local current_model="${model:-}"
+  local use_fallback="0"
+  
+  local args=(--print --force --output-format text --workspace "$(pwd)")
+  if [[ -n "$api_key" ]]; then
+    args+=(--api-key "$api_key")
+  fi
+  if [[ -n "$current_model" ]]; then
+    args+=(--model "$current_model")
+  fi
+
+  # run with a minimal environment to avoid shell integration/env conflicts
+  # that can cause the agent cli to exit 0 with empty output.
+  local env_args=(env -i "HOME=$HOME" "PATH=$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+  if [[ -n "${LANG:-}" ]]; then
+    env_args+=("LANG=$LANG")
+  fi
+  if [[ -n "${LC_ALL:-}" ]]; then
+    env_args+=("LC_ALL=$LC_ALL")
+  fi
+
+  local log_prefix_script
+  log_prefix_script="$(pwd)/agent_factory/log_prefix.py"
+  : > "$log_file"
+
+  # pass the prompt via stdin to avoid argv size limits for large goal/task files
+  if ! printf '%s' "$profile_content" | "${env_args[@]}" "$agent_bin" "${args[@]}" 2>&1 | /usr/bin/python3 "$log_prefix_script" >>"$log_file"; then
+    # check if it's a rate limit error
+    if grep -qiE "(hit your hard limit|rate limit|429|quota|ActionRequiredError)" "$log_file" 2>/dev/null; then
+      if [[ -n "$fallback_model" ]] && [[ "$current_model" != "$fallback_model" ]]; then
+        echo "rate limit detected, retrying with fallback model: $fallback_model" >&2
+        use_fallback="1"
+        current_model="$fallback_model"
+        
+        # retry with fallback model
+        args=(--print --force --output-format text --workspace "$(pwd)")
+        if [[ -n "$api_key" ]]; then
+          args+=(--api-key "$api_key")
+        fi
+        args+=(--model "$fallback_model")
+        
+        # append fallback attempt to log
+        {
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "FALLBACK ATTEMPT with model: $fallback_model"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+        } | /usr/bin/python3 "$log_prefix_script" >> "$log_file"
+        
+        if ! printf '%s' "$profile_content" | "${env_args[@]}" "$agent_bin" "${args[@]}" 2>&1 | /usr/bin/python3 "$log_prefix_script" >>"$log_file"; then
+          rm -f "$tmp_prompt"
+          return 1
+        fi
+      else
+        rm -f "$tmp_prompt"
+        return 1
+      fi
+    else
+      rm -f "$tmp_prompt"
+      return 1
+    fi
+  fi
+  rm -f "$tmp_prompt"
+
+  if [[ ! -s "$log_file" ]]; then
+    echo "empty agent output: $log_label" >&2
+    return 2
+  fi
+
+  if grep -q "NEED-INFO:" "$log_file"; then
+    echo "agent requested input; requeueing: $log_label" >&2
+    return 3
+  fi
+  
+  if [[ "$use_fallback" == "1" ]]; then
+    echo "successfully completed with fallback model: $fallback_model" >&2
+  fi
+}
+
+spawn_once() {
+  spawn_with_file "$profile" "$(basename "$profile")"
+}
+
+consume_queue() {
+  local processed_dir="${queue_dir%/}/processed"
+  mkdir -p "$processed_dir"
+  local max_worker_pending="${MAX_WORKER_PENDING:-5}"
+  local judge_pause="${JUDGE_PAUSE_ON_PENDING:-1}"
+  local max_subplanner_pending="${MAX_SUBPLANNER_PENDING:-3}"
+  while true; do
+    local spawned="0"
+    local task_file
+    local IFS=$'\n'
+
+    # pause worker/subplanner when judge has pending work
+    if [[ "$judge_pause" == "1" ]]; then
+      qbase="$(basename "$queue_dir")"
+      if [[ "$qbase" == "queue" || "$qbase" == "subplanner_queue" ]]; then
+        judge_pending="$(find "tasks/judge_queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+        if [[ "$judge_pending" -gt 0 ]]; then
+          sleep "$sleep_secs"
+          continue
+        fi
+      fi
+    fi
+
+    # throttle sub-planner if worker queue is already large
+    if [[ "$(basename "$queue_dir")" == "subplanner_queue" ]]; then
+      worker_pending="$(find "tasks/queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+      if [[ "$worker_pending" -ge "$max_worker_pending" ]]; then
+        sleep "$sleep_secs"
+        continue
+      fi
+      planner_pending="$(find "tasks/planner_queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+      if [[ "$planner_pending" -gt 0 ]]; then
+        sleep "$sleep_secs"
+        continue
+      fi
+    fi
+
+    # throttle planner if subplanner queue is already large
+    if [[ "$(basename "$queue_dir")" == "planner_queue" ]]; then
+      subplanner_pending="$(find "tasks/subplanner_queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+      if [[ "$subplanner_pending" -ge "$max_subplanner_pending" ]]; then
+        sleep "$sleep_secs"
+        continue
+      fi
+    fi
+
+    for task_file in $(find "$queue_dir" -maxdepth 1 -type f -name '*.md' | sort); do
+      local base_name
+      base_name="$(basename "$task_file")"
+      local claimed_file
+      claimed_file="$processed_dir/$base_name.$(date +%s).$$"
+      if ! mv "$task_file" "$claimed_file" 2>/dev/null; then
+        continue
+      fi
+
+      # provenance snapshot (best-effort; requires git)
+      local prov_start_ts
+      prov_start_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      local before_list
+      before_list="$(mktemp)"
+      local after_list
+      after_list="$(mktemp)"
+      if [[ -d .git ]] && command -v git >/dev/null 2>&1; then
+        git status --porcelain 2>/dev/null | awk '{print $2}' | sort -u > "$before_list" || true
+      else
+        : > "$before_list"
+      fi
+      local tmp_prompt
+      tmp_prompt="$(mktemp)"
+      cat "$profile" "$claimed_file" > "$tmp_prompt"
+      if ! spawn_with_file "$tmp_prompt" "$base_name"; then
+        mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+        echo "failed to process: $base_name" >&2
+        rm -f "$before_list" "$after_list" || true
+        continue
+      fi
+
+      local prov_end_ts
+      prov_end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      if [[ -d .git ]] && command -v git >/dev/null 2>&1; then
+        git status --porcelain 2>/dev/null | awk '{print $2}' | sort -u > "$after_list" || true
+      else
+        : > "$after_list"
+      fi
+
+      /usr/bin/python3 - <<'PY' > "${claimed_file}.provenance.json" 2>/dev/null || true
+import json
+import os
+from pathlib import Path
+
+claimed_file = os.environ["CLAIMED_FILE"]
+queue_dir = os.environ["QUEUE_DIR"]
+ticket_name = os.environ["TICKET_NAME"]
+start_ts = os.environ["START_TS"]
+end_ts = os.environ["END_TS"]
+before = Path(os.environ["BEFORE"]).read_text(errors="replace").splitlines()
+after = Path(os.environ["AFTER"]).read_text(errors="replace").splitlines()
+
+before_set = set([x for x in before if x.strip()])
+after_set = set([x for x in after if x.strip()])
+
+payload = {
+    "ticket_name": ticket_name,
+    "queue_dir": queue_dir,
+    "claimed_file": claimed_file,
+    "start_ts_utc": start_ts,
+    "end_ts_utc": end_ts,
+    "git_dirty_before": sorted(before_set),
+    "git_dirty_after": sorted(after_set),
+    "newly_dirty_files": sorted(after_set - before_set),
+    "cleared_files": sorted(before_set - after_set),
+}
+print(json.dumps(payload, indent=2))
+PY
+
+      export CLAIMED_FILE="$claimed_file"
+      export QUEUE_DIR="$queue_dir"
+      export TICKET_NAME="$base_name"
+      export START_TS="$prov_start_ts"
+      export END_TS="$prov_end_ts"
+      export BEFORE="$before_list"
+      export AFTER="$after_list"
+
+      rm -f "$before_list" "$after_list" || true
+      spawned=$((spawned + 1))
+      if [[ "$spawned" -ge "$max_spawns" ]]; then
+        break
+      fi
+    done
+    if [[ "$once" == "1" ]]; then
+      break
+    fi
+    sleep "$sleep_secs"
+  done
+}
+
+if [[ -n "$queue_dir" ]]; then
+  if [[ ! -d "$queue_dir" ]]; then
+    echo "queue dir not found: $queue_dir" >&2
+    exit 2
+  fi
+  consume_queue
+else
+  spawn_once
+fi

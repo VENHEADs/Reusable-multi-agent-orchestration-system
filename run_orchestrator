@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+service_name="${CURSOR_KEYCHAIN_SERVICE:-cursor_cli_api_key}"
+account_name="${CURSOR_KEYCHAIN_ACCOUNT:-$USER}"
+
+api_key="$(security find-generic-password -a "$account_name" -s "$service_name" -w 2>/dev/null || true)"
+if [[ -z "$api_key" ]]; then
+  # fallback to stored auth from `agent login` (preferred for personal machines).
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  exec "$repo_root/orchestrator" "$@"
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$repo_root/orchestrator" --api-key "$api_key" "$@"
+
