@@ -273,11 +273,6 @@ consume_queue() {
         sleep "$sleep_secs"
         continue
       fi
-      planner_pending="$(find "tasks/planner_queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
-      if [[ "$planner_pending" -gt 0 ]]; then
-        sleep "$sleep_secs"
-        continue
-      fi
     fi
 
     # throttle planner if subplanner queue is already large
@@ -329,14 +324,13 @@ consume_queue() {
         : > "$after_list"
       fi
 
-      export CLAIMED_FILE="$claimed_file"
-      export QUEUE_DIR="$queue_dir"
-      export TICKET_NAME="$base_name"
-      export START_TS="$prov_start_ts"
-      export END_TS="$prov_end_ts"
-      export BEFORE="$before_list"
-      export AFTER="$after_list"
-
+      CLAIMED_FILE="$claimed_file" \
+      QUEUE_DIR="$queue_dir" \
+      TICKET_NAME="$base_name" \
+      START_TS="$prov_start_ts" \
+      END_TS="$prov_end_ts" \
+      BEFORE="$before_list" \
+      AFTER="$after_list" \
       /usr/bin/python3 - <<'PY' > "${claimed_file}.provenance.json" 2>/dev/null || true
 import json
 import os

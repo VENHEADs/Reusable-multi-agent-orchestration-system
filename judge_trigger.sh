@@ -21,17 +21,43 @@ cd "$repo_root"
 
 SLEEP_SECS="${SLEEP_SECS:-15}"
 MAX_WORKER_PENDING="${JUDGE_TRIGGER_MAX_WORKER_PENDING:-2}"
-COOLDOWN_SECS="${JUDGE_TRIGGER_COOLDOWN_SECS:-300}"
+COOLDOWN_SECS="${JUDGE_TRIGGER_COOLDOWN_SECS:-600}"
+PROCESSED_DELTA="${JUDGE_TRIGGER_PROCESSED_DELTA:-5}"
 STATE_DIR=".agent_factory_state"
 LAST_TRIGGER_FILE="${STATE_DIR}/judge_last_trigger_epoch"
+LAST_PROCESSED_FILE="${STATE_DIR}/worker_processed_count_at_last_judge"
 
 pending_md_count() {
   local dir="$1"
   find "$dir" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' '
 }
 
+processed_count() {
+  find tasks/queue/processed -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
 git_is_dirty() {
   [[ -n "$(git status --porcelain 2>/dev/null)" ]]
+}
+
+cooldown_elapsed() {
+  local now last
+  now="$(date +%s)"
+  last="0"
+  if [[ -f "$LAST_TRIGGER_FILE" ]]; then
+    last="$(cat "$LAST_TRIGGER_FILE" 2>/dev/null || echo 0)"
+  fi
+  [[ $((now - last)) -ge "$COOLDOWN_SECS" ]]
+}
+
+should_trigger_due_to_worker_progress() {
+  local last_count now_count
+  last_count="0"
+  if [[ -f "$LAST_PROCESSED_FILE" ]]; then
+    last_count="$(cat "$LAST_PROCESSED_FILE" 2>/dev/null || echo 0)"
+  fi
+  now_count="$(processed_count)"
+  [[ $((now_count - last_count)) -ge "$PROCESSED_DELTA" ]]
 }
 
 ensure_judge_ticket() {
@@ -42,13 +68,7 @@ ensure_judge_ticket() {
 
   mkdir -p "$STATE_DIR"
   now="$(date +%s)"
-  last="0"
-  if [[ -f "$LAST_TRIGGER_FILE" ]]; then
-    last="$(cat "$LAST_TRIGGER_FILE" 2>/dev/null || echo 0)"
-  fi
-  if [[ $((now - last)) -lt "$COOLDOWN_SECS" ]]; then
-    return 0
-  fi
+  now_processed="$(processed_count)"
 
   local ts
   ts="$(date +%Y%m%d_%H%M%S)"
@@ -60,17 +80,21 @@ Run tests + lint. If all pass, commit meaningful changes. If any fail, do not co
 EOF
 
   echo "$now" > "$LAST_TRIGGER_FILE"
+  echo "$now_processed" > "$LAST_PROCESSED_FILE"
 }
 
 while true; do
   if [[ -d .git ]] && git_is_dirty; then
-    # run judge only when the pipeline is idle to avoid generating new work
-    # while a prior review/commit cycle is still pending.
-    worker_pending="$(pending_md_count tasks/queue)"
-    if [[ "$worker_pending" -le "$MAX_WORKER_PENDING" ]] && \
-       [[ "$(pending_md_count tasks/subplanner_queue)" -eq 0 ]] && \
-       [[ "$(pending_md_count tasks/planner_queue)" -eq 0 ]]; then
+    # trigger when enough worker tickets were processed since last judge,
+    # and enforce a cooldown to avoid spam.
+    if cooldown_elapsed && should_trigger_due_to_worker_progress; then
       ensure_judge_ticket
+    else
+      # also allow the original "near-idle" trigger (cheaper than always-on)
+      worker_pending="$(pending_md_count tasks/queue)"
+      if cooldown_elapsed && [[ "$worker_pending" -le "$MAX_WORKER_PENDING" ]]; then
+        ensure_judge_ticket
+      fi
     fi
   fi
   sleep "$SLEEP_SECS"
