@@ -36,9 +36,10 @@ queue_dir=""
 max_spawns="1"
 sleep_secs="5"
 model=""
-fallback_model="${FALLBACK_MODEL:-gpt-5.2-codex-low}"
+fallback_model="${FALLBACK_MODEL:-claude-3-5-sonnet-20241022}"
 dry_run="0"
 once="0"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -181,7 +182,7 @@ spawn_with_file() {
   fi
 
   local log_prefix_script
-  log_prefix_script="$(pwd)/agent_factory/log_prefix.py"
+  log_prefix_script="${script_dir}/log_prefix.py"
   : > "$log_file"
 
   # pass the prompt via stdin to avoid argv size limits for large goal/task files
@@ -316,9 +317,10 @@ consume_queue() {
       if ! spawn_with_file "$tmp_prompt" "$base_name"; then
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
         echo "failed to process: $base_name" >&2
-        rm -f "$before_list" "$after_list" || true
+        rm -f "$before_list" "$after_list" "$tmp_prompt" || true
         continue
       fi
+      rm -f "$tmp_prompt" || true
 
       local prov_end_ts
       prov_end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -327,6 +329,14 @@ consume_queue() {
       else
         : > "$after_list"
       fi
+
+      export CLAIMED_FILE="$claimed_file"
+      export QUEUE_DIR="$queue_dir"
+      export TICKET_NAME="$base_name"
+      export START_TS="$prov_start_ts"
+      export END_TS="$prov_end_ts"
+      export BEFORE="$before_list"
+      export AFTER="$after_list"
 
       /usr/bin/python3 - <<'PY' > "${claimed_file}.provenance.json" 2>/dev/null || true
 import json
@@ -357,14 +367,6 @@ payload = {
 }
 print(json.dumps(payload, indent=2))
 PY
-
-      export CLAIMED_FILE="$claimed_file"
-      export QUEUE_DIR="$queue_dir"
-      export TICKET_NAME="$base_name"
-      export START_TS="$prov_start_ts"
-      export END_TS="$prov_end_ts"
-      export BEFORE="$before_list"
-      export AFTER="$after_list"
 
       rm -f "$before_list" "$after_list" || true
       spawned=$((spawned + 1))
