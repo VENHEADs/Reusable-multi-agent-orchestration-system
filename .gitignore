@@ -1,0 +1,8 @@
+# runtime artifacts
+logs/
+tasks/
+.agent_factory_state/
+
+# os
+.DS_Store
+

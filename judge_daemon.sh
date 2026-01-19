@@ -15,6 +15,7 @@ BLOCKER_TICKET_PATH="${BLOCKER_TICKET_PATH:-.agent_factory_state/judge_blocker.m
 JUDGE_AUTO_PUSH="${JUDGE_AUTO_PUSH:-1}"
 JUDGE_PUSH_REMOTE="${JUDGE_PUSH_REMOTE:-origin}"
 JUDGE_WAIVERS_FILE="${JUDGE_WAIVERS_FILE:-agent_factory/judge_waivers.json}"
+PYTEST_MAXFAIL="${PYTEST_MAXFAIL:-5}"
 
 JUDGE_INCLUDE_PATHS_DEFAULT="agent_factory data_prep pricing_algorithms tests pyproject.toml requirements.txt analyze_historical_coverage.py"
 JUDGE_INCLUDE_PATHS="${JUDGE_INCLUDE_PATHS:-$JUDGE_INCLUDE_PATHS_DEFAULT}"
@@ -324,6 +325,7 @@ process_ticket() {
   local ruff_check_fix_out="${tmp_dir}/ruff_check_fix.txt"
   local ruff_check_out="${tmp_dir}/ruff_check.txt"
   local ruff_check_concise_out="${tmp_dir}/ruff_check_concise.txt"
+  local pytest_quick_out="${tmp_dir}/pytest_quick.txt"
   local pytest_out="${tmp_dir}/pytest.txt"
   local combined_out="${tmp_dir}/combined.txt"
   local unwaived_out="${tmp_dir}/ruff_unwaived.txt"
@@ -359,22 +361,27 @@ process_ticket() {
     fi
   fi
 
-  if ! run_cmd_capture "pytest" "$pytest_out" python -m pytest; then
+  # fast pytest for actionable failure tracebacks
+  if ! run_cmd_capture "pytest (maxfail)" "$pytest_quick_out" python -m pytest --maxfail "$PYTEST_MAXFAIL" --tb=short; then
     ok="0"
+  else
+    # only run full suite if quick run passed
+    if ! run_cmd_capture "pytest" "$pytest_out" python -m pytest; then
+      ok="0"
+    fi
   fi
 
   # build a structured combined output that prioritizes pytest failures first,
   # then shows unwaived (blocking) and waived (non-blocking) ruff findings.
   {
-    echo "== pytest"
-    echo "\$ python -m pytest"
+    echo "== pytest (maxfail)"
+    echo "\$ python -m pytest --maxfail ${PYTEST_MAXFAIL} --tb=short"
+    /usr/bin/tail -n 220 "$pytest_quick_out" 2>/dev/null || true
     if [[ -f "$pytest_out" ]]; then
       echo ""
-      echo "-- pytest head (40 lines)"
-      /usr/bin/head -n 40 "$pytest_out" 2>/dev/null || true
-      echo ""
-      echo "-- pytest tail (180 lines)"
-      /usr/bin/tail -n 180 "$pytest_out" 2>/dev/null || true
+      echo "== pytest (full run summary)"
+      echo "\$ python -m pytest"
+      /usr/bin/tail -n 80 "$pytest_out" 2>/dev/null || true
     fi
     echo ""
     echo "== ruff unwaived (blocking)"
