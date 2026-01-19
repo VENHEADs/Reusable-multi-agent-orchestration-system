@@ -253,7 +253,6 @@ consume_queue() {
   while true; do
     local spawned="0"
     local task_file
-    local IFS=$'\n'
 
     # pause worker/subplanner when judge has pending work
     if [[ "$judge_pause" == "1" ]]; then
@@ -290,7 +289,7 @@ consume_queue() {
       fi
     fi
 
-    for task_file in $(find "$queue_dir" -maxdepth 1 -type f -name '*.md' | sort); do
+    while IFS= read -r -d '' task_file; do
       local base_name
       base_name="$(basename "$task_file")"
       local claimed_file
@@ -373,7 +372,7 @@ PY
       if [[ "$spawned" -ge "$max_spawns" ]]; then
         break
       fi
-    done
+    done < <(find "$queue_dir" -maxdepth 1 -type f -name '*.md' -print0 | sort -z)
     if [[ "$once" == "1" ]]; then
       break
     fi
