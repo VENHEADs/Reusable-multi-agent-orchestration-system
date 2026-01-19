@@ -6,7 +6,18 @@ set -euo pipefail
 # usage:
 #   ./agent_factory/launchd_stop.sh [--project-id <id>] [--remove]
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$script_dir/.git" ]]; then
+  repo_root="$script_dir"
+elif [[ -d "$script_dir/../.git" ]]; then
+  repo_root="$(cd "$script_dir/.." && pwd)"
+elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
+  repo_root="$PWD"
+else
+  repo_root="$(cd "$script_dir/.." && pwd)"
+fi
+
+agent_factory_dir="$script_dir"
 
 project_id=""
 remove="0"
@@ -80,13 +91,14 @@ done
 stray_pids="$(
   ps -ax -o pid=,command= | python3 -c "import sys
 repo_root='${repo_root}'
+agent_factory_dir='${agent_factory_dir}'
 out=[]
 for line in sys.stdin.read().splitlines():
   line=line.strip()
   if not line:
     continue
   pid_s, cmd = line.split(' ', 1)
-  if f'{repo_root}/agent_factory/orchestrator' in cmd or f'{repo_root}/agent_factory/run_orchestrator' in cmd:
+  if f'{agent_factory_dir}/orchestrator' in cmd or f'{agent_factory_dir}/run_orchestrator' in cmd:
     out.append(pid_s)
 for pid in out:
   print(pid)

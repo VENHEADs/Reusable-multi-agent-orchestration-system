@@ -11,7 +11,18 @@ set -euo pipefail
 # - plists are written to: ~/Library/LaunchAgents/
 # - jobs are loaded into: gui/$(id -u)
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$script_dir/.git" ]]; then
+  repo_root="$script_dir"
+elif [[ -d "$script_dir/../.git" ]]; then
+  repo_root="$(cd "$script_dir/.." && pwd)"
+elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
+  repo_root="$PWD"
+else
+  repo_root="$(cd "$script_dir/.." && pwd)"
+fi
+
+agent_factory_dir="$script_dir"
 
 project_id=""
 model=""
@@ -100,7 +111,7 @@ write_plist() {
 
   # timestamp each line written to logs/<role>.out and logs/<role>.err.
   local cmd
-  cmd="cd \"${repo_root}\"; exec \"${repo_root}/agent_factory/run_orchestrator\" --profile \"${repo_root}/Agent_profiles/${profile}\" --goal-file \"${repo_root}/goal.md\" --queue-dir \"${repo_root}/tasks/${queue_dir}\" --max 1 --sleep 10 ${model_flag} 1> >( /usr/bin/python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.out\" ) 2> >( /usr/bin/python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.err\" )"
+  cmd="cd \"${repo_root}\"; exec \"${agent_factory_dir}/run_orchestrator\" --profile \"${repo_root}/Agent_profiles/${profile}\" --goal-file \"${repo_root}/goal.md\" --queue-dir \"${repo_root}/tasks/${queue_dir}\" --max 1 --sleep 10 ${model_flag} 1> >( /usr/bin/python3 \"${agent_factory_dir}/log_prefix.py\" >> \"${repo_root}/logs/${role}.out\" ) 2> >( /usr/bin/python3 \"${agent_factory_dir}/log_prefix.py\" >> \"${repo_root}/logs/${role}.err\" )"
 
   cat >"$plist_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -158,7 +169,7 @@ cat >"$plist_path" <<EOF
     <string>${label}</string>
     <key>ProgramArguments</key>
     <array>
-      <string>${repo_root}/agent_factory/judge_trigger.sh</string>
+      <string>${agent_factory_dir}/judge_trigger.sh</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${repo_root}</string>

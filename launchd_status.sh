@@ -6,7 +6,16 @@ set -euo pipefail
 # usage:
 #   ./agent_factory/launchd_status.sh [--project-id <id>]
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$script_dir/.git" ]]; then
+  repo_root="$script_dir"
+elif [[ -d "$script_dir/../.git" ]]; then
+  repo_root="$(cd "$script_dir/.." && pwd)"
+elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
+  repo_root="$PWD"
+else
+  repo_root="$(cd "$script_dir/.." && pwd)"
+fi
 
 project_id=""
 while [[ $# -gt 0 ]]; do
