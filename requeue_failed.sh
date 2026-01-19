@@ -88,7 +88,7 @@ for processed_file in "$processed_dir"/*.md.*; do
   fi
   
   # check for empty output
-  if [[ "$is_failed" == "0" ]] && [[ ! -s "$log_file" ]] || [[ "$(wc -l < "$log_file" | tr -d ' ')" -lt 3 ]]; then
+  if [[ "$is_failed" == "0" ]] && { [[ ! -s "$log_file" ]] || [[ "$(wc -l < "$log_file" | tr -d ' ')" -lt 3 ]]; }; then
     is_failed="1"
     failure_reason="empty output"
   fi
