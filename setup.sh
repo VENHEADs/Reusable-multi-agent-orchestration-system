@@ -13,6 +13,8 @@ set -euo pipefail
 
 PROJECT_NAME="${1:-$(basename "$(pwd)")}"
 REPO_ROOT="$(pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+template_dir="$script_dir"
 
 echo "Setting up agent factory for project: $PROJECT_NAME"
 echo "Repo root: $REPO_ROOT"
@@ -34,28 +36,28 @@ fi
 
 # Copy template profiles (4-agent system)
 if [[ ! -f Agent_profiles/primary_planner.md ]]; then
-  cp agent_factory/Agent_profiles/template_primary_planner.md Agent_profiles/primary_planner.md
+  cp "$template_dir/Agent_profiles/template_primary_planner.md" Agent_profiles/primary_planner.md
   echo "Created Agent_profiles/primary_planner.md (edit with your project context)"
 fi
 
 if [[ ! -f Agent_profiles/sub_planner.md ]]; then
-  cp agent_factory/Agent_profiles/template_sub_planner.md Agent_profiles/sub_planner.md
+  cp "$template_dir/Agent_profiles/template_sub_planner.md" Agent_profiles/sub_planner.md
   echo "Created Agent_profiles/sub_planner.md (edit with your project context)"
 fi
 
 if [[ ! -f Agent_profiles/worker.md ]]; then
-  cp agent_factory/Agent_profiles/template_worker.md Agent_profiles/worker.md
+  cp "$template_dir/Agent_profiles/template_worker.md" Agent_profiles/worker.md
   echo "Created Agent_profiles/worker.md (edit with your project rules)"
 fi
 
 if [[ ! -f Agent_profiles/judge.md ]]; then
-  cp agent_factory/Agent_profiles/template_judge.md Agent_profiles/judge.md
+  cp "$template_dir/Agent_profiles/template_judge.md" Agent_profiles/judge.md
   echo "Created Agent_profiles/judge.md (edit with your test/lint commands)"
 fi
 
 # Copy goal template
 if [[ ! -f goal.md ]]; then
-  cp agent_factory/goal_template.md goal.md
+  cp "$template_dir/goal_template.md" goal.md
   echo "Created goal.md (edit with your project objective and success criteria)"
   echo "  This file is the source of truth - agents check it on every run"
 fi
