@@ -17,7 +17,7 @@ PROCESSED_DELTA="${JUDGE_TRIGGER_PROCESSED_DELTA:-5}"
 STATE_DIR=".agent_factory_state"
 LAST_TRIGGER_FILE="${STATE_DIR}/judge_last_trigger_epoch"
 LAST_PROCESSED_FILE="${STATE_DIR}/worker_processed_count_at_last_judge"
-BLOCKER_TICKET_PATH="${BLOCKER_TICKET_PATH:-tasks/planner_queue/00_judge_blocker.md}"
+BLOCKER_TICKET_PATH="${BLOCKER_TICKET_PATH:-.agent_factory_state/judge_blocker.md}"
 
 pending_md_count() {
   local dir="$1"
