@@ -168,7 +168,13 @@ python3 -m venv .venv
 . .venv/bin/activate
 
 python -m pip install -U pip
-python -m pip install -r requirements.txt
+if [[ -f requirements.txt ]]; then
+  python -m pip install -r requirements.txt
+fi
+if [[ -f requirements-dev.txt ]]; then
+  python -m pip install -r requirements-dev.txt
+fi
+python -m pip install pytest ruff
 
 python -c "import pytest; import ruff; print('ok: pytest and ruff importable')"
 EOF

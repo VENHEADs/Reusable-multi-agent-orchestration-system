@@ -5,8 +5,17 @@ set -euo pipefail
 #
 # Usage: ./agent_factory/queue_status.sh
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$script_dir/.git" ]]; then
+  repo_root="$script_dir"
+elif [[ -d "$script_dir/../.git" ]]; then
+  repo_root="$(cd "$script_dir/.." && pwd)"
+elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
+  repo_root="$PWD"
+else
+  repo_root="$(cd "$script_dir/.." && pwd)"
+fi
+cd "$repo_root"
 
 echo "📋 QUEUE STATUS"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
