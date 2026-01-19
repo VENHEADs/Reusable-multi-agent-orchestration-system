@@ -24,12 +24,10 @@ This creates:
 
 ### 2a. Install judge dependencies
 
-Judge runs `pytest` and `ruff`. Install them into a repo-local venv (and optionally project requirements):
+Judge runs `pytest` and `ruff`. Install them into a repo-local venv:
 
 ```bash
 ./ops/bootstrap_python.sh
-
-# If requirements.txt or requirements-dev.txt exists, it will be installed too.
 ```
 
 ### 3. Create goal file (source of truth)

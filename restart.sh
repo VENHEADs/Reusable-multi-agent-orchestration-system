@@ -5,19 +5,8 @@ set -euo pipefail
 #
 # Usage: ./agent_factory/restart.sh [--all-queues] [--dry-run]
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -d "$script_dir/.git" ]]; then
-  repo_root="$script_dir"
-elif [[ -d "$script_dir/../.git" ]]; then
-  repo_root="$(cd "$script_dir/.." && pwd)"
-elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
-  repo_root="$PWD"
-else
-  repo_root="$(cd "$script_dir/.." && pwd)"
-fi
-cd "$repo_root"
-
-agent_factory_dir="$script_dir"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 ALL_QUEUES="${1:-}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -46,7 +35,7 @@ echo
 
 # show current status
 echo "📊 Current Status:"
-"$agent_factory_dir/queue_status.sh"
+./agent_factory/queue_status.sh
 echo
 
 # requeue failed tasks
@@ -56,18 +45,18 @@ if [[ "$ALL_QUEUES" == "1" ]]; then
     if [[ -d "$queue_dir" ]]; then
       echo
       echo "  Queue: $(basename "$queue_dir")"
-      DRY_RUN="$DRY_RUN" "$agent_factory_dir/requeue_failed.sh" --queue-dir "$queue_dir"
+      DRY_RUN="$DRY_RUN" ./agent_factory/requeue_failed.sh --queue-dir "$queue_dir"
     fi
   done
 else
   echo "🔍 Requeuing failed tasks from worker queue..."
-  DRY_RUN="$DRY_RUN" "$agent_factory_dir/requeue_failed.sh" --queue-dir tasks/queue
+  DRY_RUN="$DRY_RUN" ./agent_factory/requeue_failed.sh --queue-dir tasks/queue
 fi
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "📊 Status After Requeue:"
-"$agent_factory_dir/queue_status.sh"
+./agent_factory/queue_status.sh
 
 echo
 echo "✅ System ready to continue"

@@ -7,17 +7,8 @@ set -euo pipefail
 # - if worker queue is empty and git is dirty, enqueue a judge ticket (if none pending)
 # - sleeps between checks
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -d "$script_dir/.git" ]]; then
-  repo_root="$script_dir"
-elif [[ -d "$script_dir/../.git" ]]; then
-  repo_root="$(cd "$script_dir/.." && pwd)"
-elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
-  repo_root="$PWD"
-else
-  repo_root="$(cd "$script_dir/.." && pwd)"
-fi
-cd "$repo_root"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 SLEEP_SECS="${SLEEP_SECS:-15}"
 MAX_WORKER_PENDING="${JUDGE_TRIGGER_MAX_WORKER_PENDING:-2}"
@@ -26,6 +17,7 @@ PROCESSED_DELTA="${JUDGE_TRIGGER_PROCESSED_DELTA:-5}"
 STATE_DIR=".agent_factory_state"
 LAST_TRIGGER_FILE="${STATE_DIR}/judge_last_trigger_epoch"
 LAST_PROCESSED_FILE="${STATE_DIR}/worker_processed_count_at_last_judge"
+BLOCKER_TICKET_PATH="${BLOCKER_TICKET_PATH:-tasks/planner_queue/00_judge_blocker.md}"
 
 pending_md_count() {
   local dir="$1"
@@ -36,8 +28,31 @@ processed_count() {
   find tasks/queue/processed -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
-git_is_dirty() {
-  [[ -n "$(git status --porcelain 2>/dev/null)" ]]
+git_is_effectively_dirty() {
+  /usr/bin/python3 - <<'PY'
+import subprocess
+
+ignore_prefixes = ("logs/", "tasks/", "archive/", ".agent_factory_state/")
+try:
+  out = subprocess.check_output(["git", "status", "--porcelain"], text=True)
+except Exception:
+  raise SystemExit(1)
+
+for line in out.splitlines():
+  line = line.rstrip("\n")
+  if not line:
+    continue
+  parts = line.split(maxsplit=1)
+  if len(parts) != 2:
+    continue
+  p = parts[1]
+  if " -> " in p:
+    p = p.split(" -> ", 1)[1]
+  if p.startswith(ignore_prefixes):
+    continue
+  raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 cooldown_elapsed() {
@@ -84,16 +99,24 @@ EOF
 }
 
 while true; do
-  if [[ -d .git ]] && git_is_dirty; then
-    # trigger when enough worker tickets were processed since last judge,
-    # and enforce a cooldown to avoid spam.
-    if cooldown_elapsed && should_trigger_due_to_worker_progress; then
-      ensure_judge_ticket
-    else
-      # also allow the original "near-idle" trigger (cheaper than always-on)
-      worker_pending="$(pending_md_count tasks/queue)"
-      if cooldown_elapsed && [[ "$worker_pending" -le "$MAX_WORKER_PENDING" ]]; then
+  if [[ -d .git ]] && git_is_effectively_dirty; then
+    # if a blocker exists, only re-run judge when there's new worker progress
+    # (prevents spam, but stays automatic once fixes land).
+    if [[ -f "$BLOCKER_TICKET_PATH" ]]; then
+      if cooldown_elapsed && should_trigger_due_to_worker_progress; then
         ensure_judge_ticket
+      fi
+    else
+      # trigger when enough worker tickets were processed since last judge,
+      # and enforce a cooldown to avoid spam.
+      if cooldown_elapsed && should_trigger_due_to_worker_progress; then
+        ensure_judge_ticket
+      else
+        # also allow the original "near-idle" trigger (cheaper than always-on)
+        worker_pending="$(pending_md_count tasks/queue)"
+        if cooldown_elapsed && [[ "$worker_pending" -le "$MAX_WORKER_PENDING" ]]; then
+          ensure_judge_ticket
+        fi
       fi
     fi
   fi

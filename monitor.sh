@@ -5,17 +5,8 @@ set -euo pipefail
 #
 # Usage: ./agent_factory/monitor.sh [--watch] [--queues] [--logs] [--git] [--launchd] [--all]
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -d "$script_dir/.git" ]]; then
-  repo_root="$script_dir"
-elif [[ -d "$script_dir/../.git" ]]; then
-  repo_root="$(cd "$script_dir/.." && pwd)"
-elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
-  repo_root="$PWD"
-else
-  repo_root="$(cd "$script_dir/.." && pwd)"
-fi
-cd "$repo_root"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 WATCH="${1:-}"
 SHOW_QUEUES="${SHOW_QUEUES:-1}"
@@ -143,9 +134,10 @@ show_git() {
   fi
   
   # uncommitted changes
-  changes="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+  unstaged="$(git status --porcelain 2>/dev/null | grep -c '^[^ ]' || echo 0)"
+  staged="$(git status --porcelain 2>/dev/null | grep -c '^[^ ]' | grep -c '^[MAD]' || echo 0)"
   
-  if [[ "$changes" -gt 0 ]]; then
+  if [[ "$unstaged" -gt 0 ]] || [[ "$staged" -gt 0 ]]; then
     echo "  📝 Uncommitted changes:"
     git status --short 2>/dev/null | head -n 10 | sed 's/^/     /'
     if [[ "$(git status --short 2>/dev/null | wc -l)" -gt 10 ]]; then

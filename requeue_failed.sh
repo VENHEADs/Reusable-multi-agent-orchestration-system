@@ -5,17 +5,8 @@ set -euo pipefail
 #
 # Usage: ./agent_factory/requeue_failed.sh [--queue-dir <dir>] [--dry-run]
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -d "$script_dir/.git" ]]; then
-  repo_root="$script_dir"
-elif [[ -d "$script_dir/../.git" ]]; then
-  repo_root="$(cd "$script_dir/.." && pwd)"
-elif [[ -d "$PWD/tasks" || -f "$PWD/goal.md" ]]; then
-  repo_root="$PWD"
-else
-  repo_root="$(cd "$script_dir/.." && pwd)"
-fi
-cd "$repo_root"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
 
 QUEUE_DIR="tasks/queue"
 DRY_RUN="0"
@@ -97,7 +88,7 @@ for processed_file in "$processed_dir"/*.md.*; do
   fi
   
   # check for empty output
-  if [[ "$is_failed" == "0" ]] && { [[ ! -s "$log_file" ]] || [[ "$(wc -l < "$log_file" | tr -d ' ')" -lt 3 ]]; }; then
+  if [[ "$is_failed" == "0" ]] && [[ ! -s "$log_file" ]] || [[ "$(wc -l < "$log_file" | tr -d ' ')" -lt 3 ]]; then
     is_failed="1"
     failure_reason="empty output"
   fi
