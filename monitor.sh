@@ -14,6 +14,7 @@ SHOW_LOGS="${SHOW_LOGS:-1}"
 SHOW_GIT="${SHOW_GIT:-1}"
 SHOW_LAUNCHD="${SHOW_LAUNCHD:-1}"
 SHOW_GOAL="${SHOW_GOAL:-1}"
+SHOW_BLOCKERS="${SHOW_BLOCKERS:-1}"
 
 # parse arguments
 if [[ "${1:-}" == "--watch" ]]; then
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --logs) SHOW_LOGS="1"; SHOW_QUEUES="0"; SHOW_GIT="0"; SHOW_LAUNCHD="0"; SHOW_GOAL="0"; shift ;;
     --git) SHOW_GIT="1"; SHOW_QUEUES="0"; SHOW_LOGS="0"; SHOW_LAUNCHD="0"; SHOW_GOAL="0"; shift ;;
     --launchd) SHOW_LAUNCHD="1"; SHOW_QUEUES="0"; SHOW_LOGS="0"; SHOW_GIT="0"; SHOW_GOAL="0"; shift ;;
+    --blockers) SHOW_BLOCKERS="1"; SHOW_QUEUES="0"; SHOW_LOGS="0"; SHOW_GIT="0"; SHOW_LAUNCHD="0"; SHOW_GOAL="0"; shift ;;
     --all) SHOW_QUEUES="1"; SHOW_LOGS="1"; SHOW_GIT="1"; SHOW_LAUNCHD="1"; SHOW_GOAL="1"; shift ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -227,6 +229,35 @@ show_goal() {
   echo
 }
 
+show_blockers() {
+  print_header "BLOCKERS"
+
+  canonical_blocker=".agent_factory_state/judge_blocker.md"
+  planner_notice="tasks/planner_queue/00_judge_blocker_notice.md"
+
+  if [[ -f "$canonical_blocker" ]]; then
+    blocker_time="$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$canonical_blocker" 2>/dev/null || stat -c "%y" "$canonical_blocker" 2>/dev/null | cut -d' ' -f1-2 || echo 'unknown')"
+    summary="$(awk 'BEGIN{in=0} /^## Summary/{in=1; next} in==1 && NF{print; exit}' "$canonical_blocker" 2>/dev/null || true)"
+    echo "  ❌ judge blocker: $canonical_blocker"
+    echo "     Updated: $blocker_time"
+    if [[ -n "$summary" ]]; then
+      echo "     Summary: ${summary:0:90}"
+    fi
+    echo "     Preview:"
+    sed -n '1,30p' "$canonical_blocker" 2>/dev/null | sed 's/^/       /'
+    echo
+  else
+    echo "  ✅ no canonical judge blocker found"
+    echo
+  fi
+
+  if [[ -f "$planner_notice" ]]; then
+    notice_time="$(stat -f "%Sm" -t "%Y-%m-%d %H:%M:%S" "$planner_notice" 2>/dev/null || stat -c "%y" "$planner_notice" 2>/dev/null | cut -d' ' -f1-2 || echo 'unknown')"
+    echo "  ℹ️  planner notice present: $planner_notice (updated: $notice_time)"
+    echo
+  fi
+}
+
 show_failed_tasks() {
   print_header "FAILURE SIGNALS"
 
@@ -266,6 +297,7 @@ main() {
   echo
   
   [[ "$SHOW_GOAL" == "1" ]] && show_goal
+  [[ "$SHOW_BLOCKERS" == "1" ]] && show_blockers
   [[ "$SHOW_QUEUES" == "1" ]] && show_queues
   [[ "$SHOW_LOGS" == "1" ]] && show_logs
   [[ "$SHOW_GIT" == "1" ]] && show_git
