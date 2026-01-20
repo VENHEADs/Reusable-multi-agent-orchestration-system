@@ -3,6 +3,14 @@ logs/
 tasks/
 .agent_factory_state/
 
+# log files (explicit patterns for clarity, though logs/ covers them)
+*.log
+*.log.gz
+*.err
+*.out
+*.launchd_stderr
+*.launchd_stdout
+
 # os
 .DS_Store
 

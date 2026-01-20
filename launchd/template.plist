@@ -6,16 +6,9 @@
     <string>com.YOUR_PROJECT.ROLE</string>
     <key>ProgramArguments</key>
     <array>
-      <string>REPO_ROOT/agent_factory/run_orchestrator</string>
-      <string>--profile</string>
-      <string>REPO_ROOT/Agent_profiles/ROLE_PROFILE.md</string>
-      <string>--goal-file</string>
-      <string>REPO_ROOT/goal.md</string>
-      <string>--queue-dir</string>
-      <string>REPO_ROOT/tasks/QUEUE_DIR</string>
-      <string>--max</string>
-      <string>1</string>
-      <string>--once</string>
+      <string>/bin/bash</string>
+      <string>-lc</string>
+      <string>cd "REPO_ROOT"; exec "REPO_ROOT/agent_factory/run_orchestrator" --profile "REPO_ROOT/Agent_profiles/ROLE_PROFILE.md" --goal-file "REPO_ROOT/goal.md" --queue-dir "REPO_ROOT/tasks/QUEUE_DIR" --max 1 --once 1&gt; &gt;( python3 "REPO_ROOT/agent_factory/log_prefix.py" &gt;&gt; "REPO_ROOT/logs/ROLE.out" ) 2&gt; &gt;( python3 "REPO_ROOT/agent_factory/log_prefix.py" &gt;&gt; "REPO_ROOT/logs/ROLE.err" )</string>
     </array>
     <key>WorkingDirectory</key>
     <string>REPO_ROOT</string>
@@ -31,8 +24,12 @@
     <dict>
       <key>AGENT_BIN</key>
       <string>~/.local/bin/agent</string>
+      <key>HOME</key>
+      <string>HOME_PATH</string>
+      <key>USER</key>
+      <string>USER_NAME</string>
       <key>PATH</key>
-      <string>~/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <string>REPO_ROOT/.venv/bin:HOME_PATH/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
   </dict>
 </plist>

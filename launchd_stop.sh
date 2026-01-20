@@ -8,6 +8,12 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# load centralized configuration
+AGENT_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${AGENT_FACTORY_DIR}/config.sh" ]]; then
+  source "${AGENT_FACTORY_DIR}/config.sh"
+fi
+
 project_id=""
 remove="0"
 
@@ -62,19 +68,61 @@ if [[ -n "$labels" ]]; then
 fi
 
 # stop the canonical role plists (and optionally remove them)
+# launchctl bootout sends SIGTERM, which our scripts handle gracefully
 for role in primary_planner sub_planner worker judge judge_trigger; do
   label="com.${project_id}.agent_factory.${role}"
   plist_path="${launch_agents_dir}/${label}.plist"
 
-  launchctl disable "gui/${user_id}/${label}" >/dev/null 2>&1 || true
-  if [[ -f "$plist_path" ]]; then
-    launchctl bootout "gui/${user_id}" "$plist_path" >/dev/null 2>&1 || true
+  if launchctl print "gui/${user_id}/${label}" >/dev/null 2>&1; then
+    echo "stopping ${role} (${label})..." >&2
+    launchctl disable "gui/${user_id}/${label}" >/dev/null 2>&1 || true
+    if [[ -f "$plist_path" ]]; then
+      launchctl bootout "gui/${user_id}" "$plist_path" >/dev/null 2>&1 || true
+    fi
   fi
 
   if [[ "$remove" == "1" && -f "$plist_path" ]]; then
     rm -f "$plist_path"
   fi
 done
+
+# wait for graceful shutdown of launchd jobs
+timeout="${SHUTDOWN_TIMEOUT_SECS:-60}"
+elapsed=0
+echo "waiting for graceful shutdown (timeout: ${timeout}s)..." >&2
+while [[ $elapsed -lt $timeout ]]; do
+  remaining_labels=""
+  for role in primary_planner sub_planner worker judge judge_trigger; do
+    label="com.${project_id}.agent_factory.${role}"
+    if launchctl print "gui/${user_id}/${label}" >/dev/null 2>&1; then
+      remaining_labels="${remaining_labels}${label}\n"
+    fi
+  done
+  
+  if [[ -z "$remaining_labels" ]]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) all launchd jobs stopped gracefully (${elapsed}s)" >&2
+    break
+  fi
+  
+  # log progress every 10 seconds
+  if [[ $((elapsed % 10)) -eq 0 ]] && [[ $elapsed -gt 0 ]]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) waiting for shutdown... (${elapsed}s/${timeout}s)" >&2
+  fi
+  
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+
+if [[ $elapsed -ge $timeout ]]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) warning: graceful shutdown timeout exceeded (${elapsed}s); some jobs may still be running" >&2
+  # list remaining jobs for debugging
+  for role in primary_planner sub_planner worker judge judge_trigger; do
+    label="com.${project_id}.agent_factory.${role}"
+    if launchctl print "gui/${user_id}/${label}" >/dev/null 2>&1; then
+      echo "  still running: ${label}" >&2
+    fi
+  done
+fi
 
 # stop stray orchestrator processes started outside launchd
 stray_pids="$(
@@ -94,10 +142,51 @@ for pid in out:
 )"
 
 if [[ -n "$stray_pids" ]]; then
+  echo "stopping stray orchestrator processes..." >&2
   while IFS= read -r pid; do
     [[ -z "$pid" ]] && continue
-    kill "$pid" >/dev/null 2>&1 || true
+    echo "sending SIGTERM to orchestrator process (PID: ${pid})..." >&2
+    kill -TERM "$pid" >/dev/null 2>&1 || true
   done <<< "$stray_pids"
+  
+  # wait for graceful shutdown
+  timeout="${SHUTDOWN_TIMEOUT_SECS:-60}"
+  elapsed=0
+  echo "waiting for stray processes to stop (timeout: ${timeout}s)..." >&2
+  while [[ $elapsed -lt $timeout ]]; do
+    remaining_pids=""
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        remaining_pids="${remaining_pids}${pid}\n"
+      fi
+    done <<< "$stray_pids"
+    
+    if [[ -z "$remaining_pids" ]]; then
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) all stray processes stopped gracefully (${elapsed}s)" >&2
+      break
+    fi
+    
+    # log progress every 10 seconds
+    if [[ $((elapsed % 10)) -eq 0 ]] && [[ $elapsed -gt 0 ]]; then
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) waiting for stray processes... (${elapsed}s/${timeout}s)" >&2
+    fi
+    
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  
+  # force kill any remaining processes
+  if [[ $elapsed -ge $timeout ]]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) warning: graceful shutdown timeout exceeded (${elapsed}s); force-killing remaining processes" >&2
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) force-killing orchestrator process (PID: ${pid})..." >&2
+        kill -KILL "$pid" >/dev/null 2>&1 || true
+      fi
+    done <<< "$stray_pids"
+  fi
 fi
 
 echo "stopped launchd jobs for project: ${project_id}"

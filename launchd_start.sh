@@ -13,6 +13,12 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# load centralized configuration
+AGENT_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${AGENT_FACTORY_DIR}/config.sh" ]]; then
+  source "${AGENT_FACTORY_DIR}/config.sh"
+fi
+
 project_id=""
 model=""
 fallback_model="${FALLBACK_MODEL:-}"
@@ -100,11 +106,12 @@ write_plist() {
 
   # timestamp each line written to logs/<role>.out and logs/<role>.err.
   local cmd
+  local sleep_secs="${ORCHESTRATOR_SLEEP_SECS}"
   if [[ "$role" == "judge" ]]; then
     # deterministic judge: consumes judge_queue and commits when checks pass
-    cmd="cd \"${repo_root}\"; exec \"${repo_root}/agent_factory/judge_daemon.sh\" 1> >( /usr/bin/python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.out\" ) 2> >( /usr/bin/python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.err\" )"
+    cmd="cd \"${repo_root}\"; exec \"${repo_root}/agent_factory/judge_daemon.sh\" 1> >( python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.out\" ) 2> >( python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.err\" )"
   else
-    cmd="cd \"${repo_root}\"; exec \"${repo_root}/agent_factory/run_orchestrator\" --profile \"${repo_root}/Agent_profiles/${profile}\" --goal-file \"${repo_root}/goal.md\" --queue-dir \"${repo_root}/tasks/${queue_dir}\" --max 1 --sleep 10 ${model_flag} 1> >( /usr/bin/python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.out\" ) 2> >( /usr/bin/python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.err\" )"
+    cmd="cd \"${repo_root}\"; exec \"${repo_root}/agent_factory/run_orchestrator\" --profile \"${repo_root}/Agent_profiles/${profile}\" --goal-file \"${repo_root}/goal.md\" --queue-dir \"${repo_root}/tasks/${queue_dir}\" --max 1 --sleep ${sleep_secs} ${model_flag} 1> >( python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.out\" ) 2> >( python3 \"${repo_root}/agent_factory/log_prefix.py\" >> \"${repo_root}/logs/${role}.err\" )"
   fi
 
   cat >"$plist_path" <<EOF
@@ -137,7 +144,7 @@ write_plist() {
       <key>USER</key>
       <string>${USER}</string>
       <key>PATH</key>
-      <string>${repo_root}/.venv/bin:${HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <string>${repo_root}/.venv/bin:${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 ${fallback_env}
 ${keychain_env}
     </dict>
@@ -182,7 +189,7 @@ cat >"$plist_path" <<EOF
       <key>USER</key>
       <string>${USER}</string>
       <key>PATH</key>
-      <string>${HOME}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+      <string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
   </dict>
 </plist>

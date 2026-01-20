@@ -8,6 +8,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+AGENT_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${AGENT_FACTORY_DIR}/config.sh" ]]; then
+  source "${AGENT_FACTORY_DIR}/config.sh" 2>/dev/null || true
+fi
+
 TAIL_LINES="${1:-80}"
 FOLLOW="${FOLLOW:-0}"
 
@@ -21,7 +26,7 @@ elif [[ "${1:-}" == "--tail" ]] || [[ "${1:-}" == "-n" ]]; then
   fi
 fi
 
-log_dir="logs/agent_runs"
+log_dir="${REPO_ROOT}/${AGENT_RUNS_LOG_DIR:-logs/agent_runs}"
 if [[ ! -d "$log_dir" ]]; then
   echo "No agent runs yet. Logs directory: $log_dir"
   exit 0

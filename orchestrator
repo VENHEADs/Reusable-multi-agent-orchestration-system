@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# load centralized configuration
+AGENT_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${AGENT_FACTORY_DIR}/config.sh" ]]; then
+  source "${AGENT_FACTORY_DIR}/config.sh"
+fi
+
 usage() {
   cat <<'EOF'
 usage: orchestrator --profile <path> [options]
@@ -16,7 +22,7 @@ optional:
   --max <n>                  max tasks per loop (default: 1)
   --sleep <sec>              sleep between loops (default: 5)
   --model <model>            model name passed to agent CLI
-  --fallback-model <model>   fallback model if rate limit hit (default: from $FALLBACK_MODEL or "claude-3-5-sonnet-20241022")
+  --fallback-model <model>   fallback model if rate limit hit (default: from config.sh)
   --once                     process up to --max tasks then exit (queue mode only)
   --dry-run                  print commands without executing
   -h, --help                 show help
@@ -24,7 +30,13 @@ optional:
 environment:
   AGENT_BIN                  agent CLI path (e.g., ~/.local/bin/agent)
   CURSOR_API_KEY             api key for authentication
-  FALLBACK_MODEL             fallback model name (default: "claude-3-5-sonnet-20241022")
+  FALLBACK_MODEL             fallback model name (default: from config.sh)
+  
+configuration:
+  see agent_factory/config.sh for all configurable settings including:
+  - ORCHESTRATOR_SLEEP_SECS, ORCHESTRATOR_MAX_SPAWNS
+  - MAX_WORKER_PENDING, MAX_SUBPLANNER_PENDING, JUDGE_PAUSE_ON_PENDING
+  - ORCHESTRATOR_MAX_RETRIES, ORCHESTRATOR_BACKOFF_SECS
 EOF
 }
 
@@ -33,12 +45,33 @@ agent_bin="${AGENT_BIN:-}"
 api_key="${CURSOR_API_KEY:-}"
 goal_file=""
 queue_dir=""
-max_spawns="1"
-sleep_secs="5"
+max_spawns="${ORCHESTRATOR_MAX_SPAWNS}"
+sleep_secs="${ORCHESTRATOR_SLEEP_SECS}"
 model=""
-fallback_model="${FALLBACK_MODEL:-gpt-5.2-codex-low}"
+fallback_model="${FALLBACK_MODEL}"
 dry_run="0"
 once="0"
+shutdown_requested="0"
+current_claimed_file=""
+shutdown_timeout="${SHUTDOWN_TIMEOUT_SECS}"
+shutdown_start_time=""
+
+shutdown_handler() {
+  if [[ "$shutdown_requested" == "0" ]]; then
+    shutdown_requested="1"
+    shutdown_start_time="$(date +%s)"
+    local signal_name=""
+    case "$1" in
+      SIGTERM) signal_name="SIGTERM" ;;
+      SIGINT) signal_name="SIGINT" ;;
+      *) signal_name="UNKNOWN" ;;
+    esac
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) shutdown signal received ($signal_name); finishing current task..." >&2
+  fi
+}
+
+trap 'shutdown_handler SIGTERM' SIGTERM
+trap 'shutdown_handler SIGINT' SIGINT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -126,8 +159,10 @@ spawn_with_file() {
   local prompt_file="$1"
   local log_label="${2:-$(basename "$prompt_file")}"
   log_label="${log_label//[^A-Za-z0-9_.-]/_}"
+  local model_info_file="${3:-}"
   local tmp_prompt
   tmp_prompt="$(mktemp)"
+  local shutdown_logged_in_spawn=""
   
   # build prompt: goal file (if provided) + profile + task file
   if [[ -n "$goal_file" ]]; then
@@ -151,16 +186,22 @@ spawn_with_file() {
     return 0
   fi
   local run_ts
-  run_ts="$(date +%Y%m%d_%H%M%S)"
+  run_ts="$(date -u +%Y%m%d_%H%M%S)"
+  local run_date
+  run_date="$(date -u +%Y-%m-%d)"
   local log_dir
-  log_dir="$(pwd)/logs/agent_runs"
+  log_dir="$(pwd)/${AGENT_RUNS_LOG_DIR}/${run_date}"
   mkdir -p "$log_dir"
+  if [[ -n "${LOG_LATEST_SYMLINK_NAME:-}" ]]; then
+    ln -sfn "$log_dir" "$(pwd)/${AGENT_RUNS_LOG_DIR}/${LOG_LATEST_SYMLINK_NAME}" 2>/dev/null || true
+  fi
   local log_file
   log_file="$log_dir/${run_ts}_${log_label}.log"
 
   # try with primary model first
   local current_model="${model:-}"
   local use_fallback="0"
+  local primary_model="${model:-}"
   
   local args=(--print --force --output-format text --workspace "$(pwd)")
   if [[ -n "$api_key" ]]; then
@@ -185,57 +226,1123 @@ spawn_with_file() {
   : > "$log_file"
 
   # pass the prompt via stdin to avoid argv size limits for large goal/task files
-  if ! printf '%s' "$profile_content" | "${env_args[@]}" "$agent_bin" "${args[@]}" 2>&1 | /usr/bin/python3 "$log_prefix_script" >>"$log_file"; then
-    # check if it's a rate limit error
-    if grep -qiE "(hit your hard limit|rate limit|429|quota|ActionRequiredError)" "$log_file" 2>/dev/null; then
-      if [[ -n "$fallback_model" ]] && [[ "$current_model" != "$fallback_model" ]]; then
-        echo "rate limit detected, retrying with fallback model: $fallback_model" >&2
-        use_fallback="1"
-        current_model="$fallback_model"
-        
-        # retry with fallback model
-        args=(--print --force --output-format text --workspace "$(pwd)")
-        if [[ -n "$api_key" ]]; then
-          args+=(--api-key "$api_key")
-        fi
-        args+=(--model "$fallback_model")
-        
-        # append fallback attempt to log
+  local max_retries="${ORCHESTRATOR_MAX_RETRIES}"
+  local retry_count=0
+  local initial_backoff="${ORCHESTRATOR_BACKOFF_SECS}"
+  local backoff_secs="$initial_backoff"
+  local max_backoff="${ORCHESTRATOR_MAX_BACKOFF_SECS}"
+  local is_rate_limit="0"
+  local is_transient_error="0"
+  local error_category=""
+  local timeout_secs="${AGENT_EXECUTION_TIMEOUT_SECS:-1800}"
+  local timed_out="0"
+  
+  while [[ $retry_count -lt $max_retries ]]; do
+    local exec_start
+    exec_start="$(date +%s)"
+    local agent_pid=""
+    local timeout_pid=""
+    local exit_code_file
+    exit_code_file="$(mktemp)"
+    
+    # run agent with timeout handling
+    # use explicit error handling to capture all failure modes
+    (
+      # ensure subshell errors are captured
+      set +e
+      local agent_exit=1
+      if printf '%s' "$profile_content" | "${env_args[@]}" "$agent_bin" "${args[@]}" 2>&1 | python3 "$log_prefix_script" >>"$log_file" 2>&1; then
+        agent_exit=0
+      else
+        agent_exit=$?
+      fi
+      # ensure exit code is always written (even if process is killed)
+      echo "$agent_exit" > "$exit_code_file" 2>/dev/null || echo "1" > "$exit_code_file"
+      exit "$agent_exit"
+    ) &
+    agent_pid=$!
+    
+    # timeout monitor process
+    (
+      sleep "$timeout_secs"
+      # check if agent is still running before taking timeout action
+      if kill -0 "$agent_pid" 2>/dev/null; then
         {
           echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "FALLBACK ATTEMPT with model: $fallback_model"
+          echo "TIMEOUT: agent execution exceeded ${timeout_secs}s timeout"
+          echo "killing agent process (PID: $agent_pid)"
+          echo "task will be requeued for retry"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-        } | /usr/bin/python3 "$log_prefix_script" >> "$log_file"
-        
-        if ! printf '%s' "$profile_content" | "${env_args[@]}" "$agent_bin" "${args[@]}" 2>&1 | /usr/bin/python3 "$log_prefix_script" >>"$log_file"; then
-          rm -f "$tmp_prompt"
-          return 1
+        } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+        kill -TERM "$agent_pid" 2>/dev/null || true
+        sleep 2
+        kill -KILL "$agent_pid" 2>/dev/null || true
+        # write timeout exit code only if agent was still running (avoid race where agent finishes right at timeout)
+        # check exit_code_file: if it doesn't exist or doesn't contain "0", agent didn't finish successfully
+        if [[ ! -f "$exit_code_file" ]] || [[ "$(cat "$exit_code_file" 2>/dev/null || echo "")" != "0" ]]; then
+          echo "124" > "$exit_code_file"
+        fi
+      fi
+    ) &
+    timeout_pid=$!
+    
+    # wait for agent to complete, but check for shutdown periodically
+    # also handle cases where process dies unexpectedly
+    local wait_count=0
+    local max_wait_checks=3600  # safety limit: 1 hour max wait
+    while kill -0 "$agent_pid" 2>/dev/null && [[ $wait_count -lt $max_wait_checks ]]; do
+      if [[ "$shutdown_requested" == "1" ]]; then
+        # shutdown requested: allow current task to complete but log it
+        if [[ -z "${shutdown_logged_in_spawn:-}" ]]; then
+          {
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "shutdown requested during agent execution; allowing task to complete..."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+          } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+          shutdown_logged_in_spawn="1"
+        fi
+      fi
+      sleep 1
+      wait_count=$((wait_count + 1))
+    done
+    
+    # handle case where process is still running after max wait (shouldn't happen, but safety net)
+    if kill -0 "$agent_pid" 2>/dev/null; then
+      {
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "WARNING: agent process still running after max wait checks"
+        echo "this may indicate a stuck process; forcing termination"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+      } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+      kill -TERM "$agent_pid" 2>/dev/null || true
+      sleep 2
+      kill -KILL "$agent_pid" 2>/dev/null || true
+      echo "1" > "$exit_code_file" 2>/dev/null || true
+    fi
+    
+    wait "$agent_pid" 2>/dev/null || true
+    
+    # kill timeout monitor if agent finished early
+    kill "$timeout_pid" 2>/dev/null || true
+    wait "$timeout_pid" 2>/dev/null || true
+    
+    # read exit code
+    local exit_code=0
+    if [[ -f "$exit_code_file" ]]; then
+      exit_code="$(cat "$exit_code_file" 2>/dev/null || echo "1")"
+      rm -f "$exit_code_file"
+    fi
+    
+    # check if timeout occurred
+    if [[ "$exit_code" == "124" ]]; then
+      timed_out="1"
+      local exec_end
+      exec_end="$(date +%s)"
+      local exec_duration=$((exec_end - exec_start))
+      echo "agent execution timed out after ${exec_duration}s (timeout: ${timeout_secs}s): $log_label" >&2
+      rm -f "$tmp_prompt"
+      return 4
+    fi
+    
+    if [[ "$exit_code" == "0" ]]; then
+      # check for empty output even on successful exit (fail fast)
+      local log_size_check
+      log_size_check="$(wc -c < "$log_file" 2>/dev/null | tr -d ' ' || echo "0")"
+      local log_lines_check
+      log_lines_check="$(wc -l < "$log_file" 2>/dev/null | tr -d ' ' || echo "0")"
+      
+      # enhanced empty output detection: check for meaningful content
+      # log file should have at least 1 line AND contain some non-whitespace content
+      # also check for actual agent output (not just timestamps, separators, or error messages)
+      local has_content="0"
+      local content_analysis=""
+      if [[ -f "$log_file" ]] && [[ -r "$log_file" ]]; then
+        # check if log has any non-whitespace lines (excluding empty lines and separators)
+        if grep -qE "[^[:space:]]" "$log_file" 2>/dev/null; then
+          # logs are timestamp-prefixed per line; strip timestamp prefix for content detection
+          local strip_ts_sed
+          strip_ts_sed='s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]+[[:space:]]+//'
+
+          # check if there's actual agent output (not just log prefixes, separators, or error messages)
+          # exclude: empty lines, separators (━━), timestamps, error markers, retry messages
+          local content_lines
+          content_lines="$(
+            (sed -E "$strip_ts_sed" "$log_file" 2>/dev/null || true) \
+              | (grep -vE "^[[:space:]]*$|^[[:space:]]*━━|^(ERROR|WARNING|INFO|RETRY|RATE LIMIT|TIMEOUT|empty output|NEED-INFO):" 2>/dev/null || true) \
+              | (grep -E "[^[:space:]]" 2>/dev/null || true) \
+              | wc -l \
+              | tr -d ' '
+          )"
+          if [[ "$content_lines" -ge 1 ]]; then
+            has_content="1"
+          fi
+          # analyze content for better error reporting
+          content_analysis="content_lines=${content_lines}, log_size=${log_size_check} bytes"
+          
+          # additional check: verify there's actual code or text output (not just error messages)
+          if [[ "$has_content" == "1" ]]; then
+            local actual_output_lines
+            actual_output_lines="$(
+              (sed -E "$strip_ts_sed" "$log_file" 2>/dev/null || true) \
+                | (grep -vE "^[[:space:]]*$|^[[:space:]]*━━|^(ERROR|WARNING|INFO|RETRY|RATE LIMIT|TIMEOUT|empty output|NEED-INFO|retry|backoff|waiting):" 2>/dev/null || true) \
+                | (grep -E "[a-zA-Z0-9]" 2>/dev/null || true) \
+                | wc -l \
+                | tr -d ' '
+            )"
+            if [[ "$actual_output_lines" -lt 1 ]]; then
+              # log has structure but no actual agent output
+              has_content="0"
+              content_analysis="${content_analysis}, but only ${actual_output_lines} lines of actual output"
+            fi
+          fi
+        else
+          content_analysis="no non-whitespace content found"
         fi
       else
-        rm -f "$tmp_prompt"
-        return 1
+        content_analysis="log file missing or unreadable"
       fi
-    else
-      rm -f "$tmp_prompt"
-      return 1
+      
+      if [[ "$log_size_check" == "0" ]] || [[ "$log_lines_check" -lt 1 ]] || [[ "$has_content" == "0" ]]; then
+      # allow limited retries for empty output (up to 2 attempts) before fail-fast
+        # empty output is often transient (environment issues, API hiccups, etc.)
+        local max_empty_output_retries=2
+        if [[ "$max_retries" -gt 0 && "$max_empty_output_retries" -gt "$max_retries" ]]; then
+          max_empty_output_retries="$max_retries"
+        fi
+        if [[ $retry_count -lt $max_empty_output_retries ]]; then
+          # reset error_category to ensure proper handling
+          error_category="empty_output"
+          {
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "WARNING: empty output detected (exit code 0 but no output)"
+            echo "log file size: ${log_size_check} bytes, lines: ${log_lines_check}"
+            echo "has meaningful content: ${has_content:-0}"
+            echo "content analysis: ${content_analysis:-unknown}"
+            echo "retry attempt: $((retry_count + 1))/$max_empty_output_retries"
+            echo "model: ${current_model:-default}"
+            echo "agent binary: $agent_bin"
+            echo "workspace: $(pwd)"
+            echo ""
+            echo "this may indicate:"
+            echo "  - agent CLI exited without producing output"
+            echo "  - environment configuration issue (check PATH, HOME, LANG)"
+            echo "  - prompt file was empty or malformed"
+            echo "  - agent CLI binary issue or permission problem"
+            echo "  - API authentication failure (silent exit)"
+            echo "  - transient API issue (will retry with exponential backoff)"
+            echo ""
+            echo "retrying with exponential backoff..."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+          } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+          error_category="empty_output"
+          error_detected="1"
+          retry_count=$((retry_count + 1))
+          
+          # apply exponential backoff before retry (with jitter to prevent thundering herd)
+          local next_backoff
+          local calculated=$((backoff_secs * 2))
+          if [[ $calculated -gt $max_backoff ]]; then
+            calculated=$max_backoff
+          fi
+          local jitter_percent=$((RANDOM % 21))
+          local jitter=$((calculated * jitter_percent / 100))
+          next_backoff=$((calculated + jitter))
+          
+          echo "empty output detected (attempt $retry_count/$max_empty_output_retries), waiting ${backoff_secs}s before retry..." >&2
+          sleep "$backoff_secs"
+          backoff_secs="$next_backoff"
+          
+          # try fallback model on first retry if available (may help with empty output issues)
+          if [[ $retry_count == 1 ]] && [[ -n "$fallback_model" ]] && [[ "$current_model" != "$fallback_model" ]]; then
+            {
+              echo ""
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "RETRY ATTEMPT $retry_count/$max_empty_output_retries: empty output detected"
+              echo "switching to fallback model: $fallback_model"
+              echo "previous model: ${current_model:-default}"
+              echo "applying exponential backoff: ${backoff_secs}s (with jitter)"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo ""
+            } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+            use_fallback="1"
+            current_model="$fallback_model"
+            args=(--print --force --output-format text --workspace "$(pwd)")
+            if [[ -n "$api_key" ]]; then
+              args+=(--api-key "$api_key")
+            fi
+            args+=(--model "$fallback_model")
+          fi
+          
+          continue
+        else
+          # exceeded retry limit, fail fast
+          {
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "ERROR: empty output detected (fail fast after $max_empty_output_retries attempts)"
+            echo "log file size: ${log_size_check} bytes, lines: ${log_lines_check}"
+            echo "has meaningful content: ${has_content:-0}"
+            echo "content analysis: ${content_analysis:-unknown}"
+            echo "retry attempts: $retry_count/$max_empty_output_retries"
+            echo "model: ${current_model:-default}"
+            echo "agent binary: $agent_bin"
+            echo "workspace: $(pwd)"
+            echo ""
+            echo "this may indicate:"
+            echo "  - agent CLI exited without producing output"
+            echo "  - environment configuration issue (check PATH, HOME, LANG)"
+            echo "  - prompt file was empty or malformed"
+            echo "  - agent CLI binary issue or permission problem"
+            echo "  - API authentication failure (silent exit)"
+            echo ""
+            echo "troubleshooting steps:"
+            echo "  1. verify agent CLI is executable:"
+            echo "     ls -la $agent_bin"
+            echo "  2. test agent CLI manually:"
+            echo "     echo 'test prompt' | $agent_bin --print --force --workspace '$(pwd)'"
+            echo "  3. check environment variables:"
+            echo "     env | grep -E '(PATH|HOME|LANG|CURSOR_API_KEY)'"
+            echo "  4. verify prompt file exists and has content:"
+            echo "     test -f ${tmp_prompt:-/dev/null} && wc -l ${tmp_prompt:-/dev/null} || echo 'prompt file missing'"
+            echo "  5. check API key is set (if required):"
+            echo "     test -n \"\${CURSOR_API_KEY:-}\" && echo 'API key is set' || echo 'API key is NOT set'"
+            echo "  6. check for shell integration conflicts:"
+            echo "     echo \$SHELL && which $agent_bin"
+            echo "  7. review log file for additional context:"
+            echo "     tail -50 $log_file"
+            echo ""
+            echo "task will be requeued for retry (empty output triggers requeue logic)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+          } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+          error_category="empty_output"
+          error_detected="1"
+          break
+        fi
+      fi
+      
+      # check for NEED-INFO even on successful exit (fail fast, but with better context)
+      # enhanced detection: check for variations like "NEED-INFO", "NEED INFO", "need-info", etc.
+      # also check for question patterns that indicate the agent is asking for information
+      # NEED-INFO is non-retryable: requires human intervention, so fail fast
+      local need_info_detected="0"
+      if grep -qiE "NEED-INFO:|NEED INFO:|need-info:" "$log_file" 2>/dev/null || \
+         grep -qiE "^(I need|I require|please provide|can you provide|missing information|need more information|requires additional|need clarification|need to know|what is|which|where is|how do|when should|why does)" "$log_file" 2>/dev/null; then
+        need_info_detected="1"
+      fi
+      
+      if [[ "$need_info_detected" == "1" ]]; then
+        local need_info_line
+        need_info_line="$(grep -iE "NEED-INFO:|NEED INFO:|need-info:" "$log_file" | head -1 | sed 's/^[[:space:]]*//' | head -c 500 || \
+          grep -iE "^(I need|I require|please provide|can you provide|missing information|need more information|requires additional|need clarification)" "$log_file" | head -1 | sed 's/^[[:space:]]*//' | head -c 500 || \
+          echo "NEED-INFO detected")"
+        local need_info_context=""
+        need_info_context="$(grep -iE "NEED-INFO:|NEED INFO:|need-info:|^(I need|I require|please provide|can you provide|missing information|need more information|requires additional|need clarification)" "$log_file" -B 3 -A 8 | head -12 | tail -11 | head -c 800 || echo "")"
+        local need_info_file_context=""
+        # try to extract file/line references from context (enhanced patterns)
+        need_info_file_context="$(echo "$need_info_context" | grep -oE "[a-zA-Z0-9_/.-]+\.(py|md|sh|json|yaml|yml|txt|toml|ts|tsx|js|jsx):[0-9]+" | head -5 | tr '\n' ' ' || echo "")"
+        # also try to extract question patterns
+        local need_info_question=""
+        need_info_question="$(echo "$need_info_line" | grep -oE "(what|which|where|how|when|why|who|can you|please|need|require|missing|clarify|specify).*" -i | head -c 200 || echo "")"
+        {
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "INFO: agent requested additional information (NEED-INFO detected)"
+          echo "request: $need_info_line"
+          if [[ -n "$need_info_question" ]]; then
+            echo ""
+            echo "question: $need_info_question"
+          fi
+          if [[ -n "$need_info_context" ]]; then
+            echo ""
+            echo "context:"
+            echo "$need_info_context"
+          fi
+          if [[ -n "$need_info_file_context" ]]; then
+            echo ""
+            echo "referenced files: $need_info_file_context"
+          fi
+          echo ""
+          echo "retry attempt: $retry_count/$max_retries"
+          echo "model: ${current_model:-default}"
+          echo "task file: ${prompt_file:-unknown}"
+          echo ""
+          echo "action required:"
+          echo "  - review the agent's request in the log file"
+          echo "  - provide the requested information or update the task file"
+          echo "  - task will be requeued and processed again after information is available"
+          echo ""
+          echo "to prevent NEED-INFO responses:"
+          echo "  - ensure task files contain all required information"
+          echo "  - update agent profiles to explicitly forbid questions"
+          echo "  - include file paths, line numbers, and specific context in task descriptions"
+          echo ""
+          echo "task will be requeued for later processing (NEED-INFO triggers requeue logic)"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+        } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+        error_category="need_info"
+        error_detected="1"
+        # treat as non-retryable to fail fast (NEED-INFO requires human intervention)
+        # no retries: agent needs information that only human can provide
+        # this will trigger requeue logic in consume_queue function
+        break
+      fi
+      
+      # successful execution with valid output
+      break
     fi
+    
+    # detect error category for appropriate handling
+    # note: error_detected is set to 1 when we find a known error pattern
+    # this allows us to distinguish between known errors and unknown failures
+    local error_detected="0"
+    error_category=""
+    
+    # check log file exists and is readable before error detection
+    if [[ ! -f "$log_file" ]] || [[ ! -r "$log_file" ]]; then
+      {
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "ERROR: log file is missing or unreadable"
+        echo "log file: $log_file"
+        echo "exit code: $exit_code"
+        echo "this may indicate a filesystem issue or permission problem"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+      } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+      error_category="log_error"
+      error_detected="1"
+      retry_count=$((retry_count + 1))
+      if [[ $retry_count -lt $max_retries ]]; then
+        sleep "$backoff_secs"
+        local next_backoff
+        local calculated=$((backoff_secs * 2))
+        if [[ $calculated -gt $max_backoff ]]; then
+          calculated=$max_backoff
+        fi
+        local jitter_percent=$((RANDOM % 21))
+        local jitter=$((calculated * jitter_percent / 100))
+        backoff_secs=$((calculated + jitter))
+        continue
+      else
+        break
+      fi
+    fi
+    
+    # check for NEED-INFO even on non-zero exit codes (non-retryable)
+    if grep -qiE "NEED-INFO:|NEED INFO:|need-info:" "$log_file" 2>/dev/null || \
+       grep -qiE "^(I need|I require|please provide|can you provide|missing information|need more information|requires additional|need clarification|need to know|what is|which|where is|how do|when should|why does)" "$log_file" 2>/dev/null; then
+      error_category="need_info"
+      error_detected="1"
+    fi
+
+    # check for rate limit errors (enhanced patterns including retry-after headers)
+    # expanded patterns to catch more rate limit variations
+    # also check stderr if log file doesn't have the error
+    local rate_limit_in_log="0"
+    if [[ "$error_detected" == "0" ]]; then
+      if grep -qiE "(hit your hard limit|rate limit|429|quota|ActionRequiredError|too many requests|request.*limit|throttled|rate.*exceeded|retry.*after|x-ratelimit|rate.*limit.*exceeded|quota.*exceeded|requests.*per.*minute|requests.*per.*hour|rate.*limit.*reached|throttling|rate.*throttle)" "$log_file" 2>/dev/null; then
+        rate_limit_in_log="1"
+      fi
+    fi
+    
+    if [[ "$rate_limit_in_log" == "1" ]]; then
+      is_rate_limit="1"
+      is_transient_error="1"
+      error_category="rate_limit"
+      error_detected="1"
+      
+      # try to extract retry-after value from log for better backoff timing
+      # check multiple patterns: "retry after 60", "retry-after: 60", "Retry-After: 60", "Retry-After: 60 seconds"
+      local retry_after_secs=""
+      if grep -qiE "(retry.*after|retry-after)" "$log_file" 2>/dev/null; then
+        # try to extract numeric value after "retry after" or "retry-after"
+        # handle both "retry after 60" and "Retry-After: 60" formats
+        # also handle "Retry-After: 60 seconds" and "retry after 60s"
+        retry_after_secs="$(grep -iE "(retry.*after|retry-after)" "$log_file" | head -1 | grep -oE "[0-9]+" | head -1 || echo "")"
+        if [[ -n "$retry_after_secs" ]] && [[ "$retry_after_secs" -gt 0 ]] && [[ "$retry_after_secs" -lt 3600 ]]; then
+          # use retry-after if it's reasonable (less than 1 hour)
+          # always respect server guidance: use retry-after as minimum backoff
+          if [[ "$retry_after_secs" -gt "$backoff_secs" ]]; then
+            backoff_secs="$retry_after_secs"
+            echo "rate limit detected with retry-after header: ${retry_after_secs}s, using as backoff" >&2
+          elif [[ "$retry_after_secs" -ge "$initial_backoff" ]]; then
+            # if retry-after is less than current backoff but reasonable, use it as minimum
+            # this ensures we respect server guidance while maintaining exponential backoff
+            backoff_secs="$retry_after_secs"
+            echo "rate limit detected with retry-after header: ${retry_after_secs}s, using as minimum backoff" >&2
+          fi
+        fi
+      fi
+      
+      # calculate exponential backoff with jitter (prevents thundering herd)
+      # exponential backoff: double the current backoff, capped at max_backoff
+      # if retry-after header was provided, ensure we use at least that value
+      local base_backoff="$backoff_secs"
+      if [[ -n "${retry_after_secs:-}" ]] && [[ "$retry_after_secs" -gt 0 ]] && [[ "$retry_after_secs" -gt "$backoff_secs" ]]; then
+        base_backoff="$retry_after_secs"
+      fi
+      
+      local next_backoff
+      local calculated=$((base_backoff * 2))
+      if [[ $calculated -gt $max_backoff ]]; then
+        calculated=$max_backoff
+      fi
+      # ensure calculated backoff respects retry-after minimum (if provided)
+      if [[ -n "${retry_after_secs:-}" ]] && [[ "$retry_after_secs" -gt 0 ]] && [[ "$calculated" -lt "$retry_after_secs" ]]; then
+        calculated="$retry_after_secs"
+      fi
+      # add jitter: random value between 0-20% of calculated backoff
+      local jitter_percent=$((RANDOM % 21))
+      local jitter=$((calculated * jitter_percent / 100))
+      next_backoff=$((calculated + jitter))
+      
+      # log rate limit detection with context for troubleshooting
+      {
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "RATE LIMIT DETECTED (attempt $retry_count/$max_retries)"
+        echo "model: ${current_model:-default}"
+        if [[ -n "$retry_after_secs" ]]; then
+          echo "retry-after header: ${retry_after_secs}s"
+        fi
+        echo "current backoff: ${backoff_secs}s"
+        echo "next backoff: ${next_backoff}s (exponential with jitter)"
+        echo "applying exponential backoff with jitter..."
+        echo ""
+        echo "troubleshooting:"
+        echo "  - check API quota/limits (may need to wait or upgrade plan)"
+        echo "  - consider increasing ORCHESTRATOR_BACKOFF_SECS (current: ${initial_backoff}s)"
+        echo "  - verify fallback model is configured (current: ${fallback_model:-none})"
+        echo "  - increase ORCHESTRATOR_MAX_RETRIES if needed (current: ${max_retries})"
+        echo "  - check ORCHESTRATOR_MAX_BACKOFF_SECS cap (current: ${max_backoff}s)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+      } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+      
+      # update backoff for next retry
+      backoff_secs="$next_backoff"
+    fi
+    # check for transient network/API errors (enhanced patterns)
+    # also check for connection errors that might not be in log file yet
+    local network_error_in_log="0"
+    if grep -qiE "(connection.*refused|connection.*reset|connection.*timeout|network.*error|502|503|504|temporary.*failure|dns.*error|name.*resolution|econnrefused|econnreset|etimedout|network.*unreachable)" "$log_file" 2>/dev/null; then
+      network_error_in_log="1"
+    fi
+    
+    if [[ "$network_error_in_log" == "1" ]]; then
+      is_transient_error="1"
+      error_category="network_error"
+      error_detected="1"
+    # check for other potentially transient API errors (enhanced patterns)
+    elif grep -qiE "(internal.*error|service.*unavailable|bad.*gateway|502|503|504|gateway.*timeout|upstream.*error|server.*error|http.*error|api.*error)" "$log_file" 2>/dev/null; then
+      is_transient_error="1"
+      error_category="api_error"
+      error_detected="1"
+    # check for authentication/authorization errors (non-retryable)
+    elif grep -qiE "(unauthorized|forbidden|401|403|authentication.*failed|invalid.*api.*key|api.*key.*expired|api.*key.*invalid)" "$log_file" 2>/dev/null; then
+      error_category="auth_error"
+      error_detected="1"
+    # check for malformed request errors (non-retryable)
+    elif grep -qiE "(bad.*request|400|malformed|invalid.*request|syntax.*error|parse.*error)" "$log_file" 2>/dev/null; then
+      error_category="request_error"
+      error_detected="1"
+    fi
+    
+    # handle retryable vs non-retryable errors
+    # non-retryable errors: auth_error, request_error (break immediately)
+    # retryable errors: rate_limit, network_error, api_error, log_error (retry with backoff)
+    # unknown errors: treat as potentially retryable (retry with backoff, but log as unknown)
+    local is_retryable="0"
+    if [[ "$error_detected" == "1" ]]; then
+      case "$error_category" in
+        auth_error|request_error|need_info)
+          # non-retryable: break immediately
+          is_retryable="0"
+          ;;
+        rate_limit|network_error|api_error|log_error)
+          # retryable: continue with retry logic
+          is_retryable="1"
+          ;;
+        *)
+          # unknown error category: treat as potentially retryable
+          # this provides resilience for unexpected error patterns
+          is_retryable="1"
+          ;;
+      esac
+    elif [[ "$exit_code" != "0" ]]; then
+      # no error pattern matched but exit code is non-zero
+      # treat as potentially retryable (may be transient)
+      is_retryable="1"
+      error_category="unknown_error"
+      error_detected="1"
+    fi
+    
+    # increment retry count for retryable errors
+    if [[ "$is_retryable" == "1" ]]; then
+      retry_count=$((retry_count + 1))
+      
+      if [[ $retry_count -lt $max_retries ]]; then
+        # apply exponential backoff with jitter before retry (including fallback attempts)
+        local error_msg=""
+        case "$error_category" in
+          rate_limit)
+            error_msg="rate limit detected"
+            ;;
+          network_error)
+            error_msg="network error detected"
+            ;;
+          api_error)
+            error_msg="transient API error detected"
+            ;;
+          log_error)
+            error_msg="log file error detected"
+            ;;
+          unknown_error)
+            error_msg="unknown error detected (treating as potentially transient)"
+            ;;
+          *)
+            error_msg="transient error detected"
+            ;;
+        esac
+        
+        # calculate next backoff with exponential progression and jitter (prevents thundering herd)
+        # exponential backoff: double the current backoff, capped at max_backoff
+        # if retry-after header was provided, ensure we use at least that value
+        # note: if rate_limit error category already calculated backoff, reuse it
+        local base_backoff="$backoff_secs"
+        if [[ -n "${retry_after_secs:-}" ]] && [[ "$retry_after_secs" -gt 0 ]] && [[ "$retry_after_secs" -gt "$backoff_secs" ]]; then
+          # if retry-after is larger than current backoff, use it as base
+          base_backoff="$retry_after_secs"
+        fi
+        
+        local next_backoff
+        local calculated=$((base_backoff * 2))
+        if [[ $calculated -gt $max_backoff ]]; then
+          calculated=$max_backoff
+        fi
+        # ensure calculated backoff respects retry-after minimum (if provided)
+        if [[ -n "${retry_after_secs:-}" ]] && [[ "$retry_after_secs" -gt 0 ]] && [[ "$calculated" -lt "$retry_after_secs" ]]; then
+          calculated="$retry_after_secs"
+        fi
+        # add jitter: random value between 0-20% of calculated backoff
+        local jitter_percent=$((RANDOM % 21))
+        local jitter=$((calculated * jitter_percent / 100))
+        next_backoff=$((calculated + jitter))
+        
+        # try fallback model for rate limits on first retry (after backoff)
+        # also try fallback for network/API errors if configured
+        # use fallback for transient errors that might be model-specific
+        local should_use_fallback="0"
+        if [[ "$error_category" == "rate_limit" ]] && [[ -n "$fallback_model" ]] && [[ "$current_model" != "$fallback_model" ]] && [[ "$retry_count" == "1" ]]; then
+          should_use_fallback="1"
+        elif [[ "$error_category" == "network_error" ]] && [[ -n "$fallback_model" ]] && [[ "$current_model" != "$fallback_model" ]] && [[ "$retry_count" == "1" ]]; then
+          # try fallback for network errors too (may be model-specific issue)
+          should_use_fallback="1"
+        elif [[ "$error_category" == "api_error" ]] && [[ -n "$fallback_model" ]] && [[ "$current_model" != "$fallback_model" ]] && [[ "$retry_count" == "1" ]]; then
+          # try fallback for API errors (may be model-specific endpoint issue)
+          should_use_fallback="1"
+        fi
+        
+        if [[ "$should_use_fallback" == "1" ]]; then
+          echo "$error_msg (attempt $retry_count/$max_retries), waiting ${backoff_secs}s before fallback retry with model: $fallback_model" >&2
+          {
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "RETRY ATTEMPT $retry_count/$max_retries: ${error_category} detected"
+            echo "applying exponential backoff: ${backoff_secs}s (with jitter)"
+            echo "switching to fallback model: $fallback_model"
+            echo "error category: ${error_category:-unknown}"
+            echo "exit code: $exit_code"
+            echo "previous model: ${current_model:-default}"
+            if [[ -n "${retry_after_secs:-}" ]]; then
+              echo "retry-after header suggested: ${retry_after_secs}s"
+            fi
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+          } | python3 "$log_prefix_script" >> "$log_file"
+          
+          # apply backoff before fallback attempt
+          sleep "$backoff_secs"
+          
+          # switch to fallback model
+          use_fallback="1"
+          current_model="$fallback_model"
+          args=(--print --force --output-format text --workspace "$(pwd)")
+          if [[ -n "$api_key" ]]; then
+            args+=(--api-key "$api_key")
+          fi
+          args+=(--model "$fallback_model")
+          
+          # update backoff for next retry (if needed)
+          backoff_secs="$next_backoff"
+          continue
+        fi
+        
+        # exponential backoff for all other retryable errors
+        echo "$error_msg (attempt $retry_count/$max_retries), waiting ${backoff_secs}s before retry..." >&2
+        {
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "RETRY ATTEMPT $retry_count/$max_retries after ${backoff_secs}s exponential backoff (with jitter)"
+          echo "error category: ${error_category:-unknown}"
+          echo "exit code: $exit_code"
+          echo "model: ${current_model:-default}"
+          echo "next backoff will be: ${next_backoff}s"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+        } | python3 "$log_prefix_script" >> "$log_file"
+        
+        # apply backoff with jitter
+        sleep "$backoff_secs"
+        
+        # update backoff for next retry
+        backoff_secs="$next_backoff"
+        continue
+      fi
+    elif [[ "$error_detected" == "1" ]] && [[ "$is_retryable" == "0" ]]; then
+      # non-retryable error (auth_error, request_error): log details and exit retry loop immediately
+      # enhanced error context extraction for better troubleshooting
+      # extract multiple error indicators to provide comprehensive debugging information
+      local last_error_lines
+      last_error_lines="$(tail -n 30 "$log_file" 2>/dev/null | head -n 15 || echo "unable to read log file")"
+      local error_context=""
+      local error_traceback=""
+      local error_summary=""
+      local error_timestamps=""
+      if [[ -f "$log_file" ]] && [[ -r "$log_file" ]]; then
+        # extract recent error messages (last 5 error lines)
+        error_context="$(grep -iE "(error|exception|failed|fatal|auth|unauthorized|forbidden|bad.*request|timeout|rate limit)" "$log_file" 2>/dev/null | tail -n 5 | head -c 500 || echo "")"
+        # try to extract traceback or stack trace if present
+        error_traceback="$(grep -A 10 -iE "(traceback|stack trace|file \".*\", line|Traceback \(most recent call last\))" "$log_file" 2>/dev/null | head -15 | head -c 800 || echo "")"
+        # extract error summary (first error line for quick reference)
+        error_summary="$(grep -iE "(error|exception|failed|fatal)" "$log_file" 2>/dev/null | head -1 | head -c 200 || echo "")"
+        # extract error timestamps to understand error frequency
+        error_timestamps="$(grep -iE "(error|exception|failed|fatal)" "$log_file" 2>/dev/null | grep -oE "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z" | tail -3 | tr '\n' ' ' || echo "")"
+      fi
+      
+      # determine error category if not already set
+      if [[ -z "$error_category" ]]; then
+        if [[ "$exit_code" -gt 0 && "$exit_code" -lt 128 ]]; then
+          error_category="execution_error"
+        elif [[ "$exit_code" -ge 128 ]]; then
+          error_category="signal_error"
+        else
+          error_category="unknown_error"
+        fi
+      fi
+      
+      local troubleshooting_msg=""
+      case "$error_category" in
+        auth_error)
+          troubleshooting_msg="  - verify API key is valid and not expired: echo \$CURSOR_API_KEY
+  - check API key permissions and scope
+  - verify authentication credentials are correct
+  - test manually: echo 'test' | $agent_bin --print --force --api-key \$CURSOR_API_KEY"
+          ;;
+        request_error)
+          troubleshooting_msg="  - verify prompt file is valid and complete: wc -l ${tmp_prompt:-/dev/null}
+  - check for syntax errors or malformed input
+  - review task file format and structure
+  - check prompt file size: $(wc -c < "${tmp_prompt:-/dev/null}" 2>/dev/null | tr -d ' ' || echo "unknown") bytes"
+          ;;
+        log_error)
+          troubleshooting_msg="  - check filesystem permissions: ls -la $log_file
+  - verify log directory exists and is writable: ls -ld $(dirname "$log_file")
+  - check disk space: df -h ."
+          ;;
+        *)
+          troubleshooting_msg="  - review log file for specific error details: tail -50 $log_file
+  - check agent CLI configuration and authentication
+  - verify prompt file is valid and complete
+  - check for syntax errors or malformed input
+  - test agent CLI manually: echo 'test' | $agent_bin --print --force"
+          ;;
+      esac
+      
+      {
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "ERROR: agent execution failed (non-retryable error)"
+        echo "exit code: $exit_code"
+        echo "error category: $error_category"
+        echo "log file: $log_file"
+        echo "model: ${current_model:-default}"
+        echo "retry attempt: $retry_count/$max_retries"
+        echo "workspace: $(pwd)"
+        if [[ -n "$error_timestamps" ]]; then
+          echo "error timestamps: $error_timestamps"
+        fi
+        echo ""
+        if [[ -n "$error_summary" ]]; then
+          echo "error summary: $error_summary"
+          echo ""
+        fi
+        if [[ -n "$error_context" ]]; then
+          echo "error context (recent errors):"
+          echo "$error_context"
+          echo ""
+        fi
+        if [[ -n "$error_traceback" ]]; then
+          echo "error traceback:"
+          echo "$error_traceback"
+          echo ""
+        fi
+        echo "last log lines:"
+        echo "$last_error_lines"
+        echo ""
+        echo "execution details:"
+        echo "  - agent binary: $agent_bin"
+        echo "  - workspace: $(pwd)"
+        echo "  - prompt file size: $(wc -c < "${tmp_prompt:-/dev/null}" 2>/dev/null | tr -d ' ' || echo "unknown") bytes"
+        echo "  - log file: $log_file"
+        echo ""
+        echo "troubleshooting:"
+        echo "$troubleshooting_msg"
+        echo ""
+        echo "task will be requeued for manual review"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+      } | python3 "$log_prefix_script" >> "$log_file"
+      error_category="${error_category:-non_retryable}"
+      break
+    elif [[ "$exit_code" != "0" ]] && [[ "$error_detected" == "0" ]]; then
+      # exit code is non-zero but no error pattern matched
+      # this is an edge case: log it and treat as potentially retryable
+      # but only if we haven't exhausted retries
+      if [[ $retry_count -lt $max_retries ]]; then
+        retry_count=$((retry_count + 1))
+        error_category="unknown_error"
+        {
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "WARNING: non-zero exit code ($exit_code) but no known error pattern detected"
+          echo "treating as potentially transient error, will retry with exponential backoff"
+          echo "retry attempt: $retry_count/$max_retries"
+          echo "exit code: $exit_code"
+          echo "model: ${current_model:-default}"
+          echo ""
+          echo "if this persists, review log file for error details:"
+          echo "  tail -50 $log_file"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+        } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+        
+        # apply exponential backoff
+        local next_backoff
+        local calculated=$((backoff_secs * 2))
+        if [[ $calculated -gt $max_backoff ]]; then
+          calculated=$max_backoff
+        fi
+        local jitter_percent=$((RANDOM % 21))
+        local jitter=$((calculated * jitter_percent / 100))
+        next_backoff=$((calculated + jitter))
+        
+        echo "unknown error (exit code $exit_code), waiting ${backoff_secs}s before retry..." >&2
+        sleep "$backoff_secs"
+        backoff_secs="$next_backoff"
+        continue
+      else
+        # retries exhausted, break and report failure
+        error_category="unknown_error"
+        break
+      fi
+    fi
+  done
+  
+  # check if execution succeeded
+  # if loop exited with retry_count < max_retries and exit_code == 0, command succeeded
+  # if loop exited with retry_count >= max_retries, command failed after all retries
+  # if loop exited early due to empty_output or need_info, fail fast
+  if [[ "$error_category" == "empty_output" ]]; then
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "ERROR: empty agent output detected (fail fast)"
+      echo "log file: $log_file"
+      echo "model: ${current_model:-default}"
+      echo ""
+      echo "this may indicate:"
+      echo "  - agent cli exited without producing output"
+      echo "  - environment configuration issue (check PATH, HOME, LANG)"
+      echo "  - prompt file was empty or malformed"
+      echo "  - agent CLI binary issue or permission problem"
+      echo "  - API authentication failure (silent exit)"
+      echo ""
+      echo "task will be requeued for retry"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+    echo "empty agent output (fail fast): $log_label (see $log_file)" >&2
+    rm -f "$tmp_prompt"
+    return 2
   fi
+  
+  if [[ "$error_category" == "need_info" ]]; then
+    local need_info_line
+    need_info_line="$(grep -iE "NEED-INFO:|NEED INFO:|need-info:" "$log_file" | head -1 | sed 's/^[[:space:]]*//' | head -c 300 || echo "NEED-INFO detected")"
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "INFO: agent requested additional information (fail fast)"
+      echo "request: $need_info_line"
+      echo ""
+      echo "action required:"
+      echo "  - review the agent's request in the log file"
+      echo "  - provide the requested information or update the task file"
+      echo "  - task will be requeued and processed again after information is available"
+      echo ""
+      echo "task will be requeued for later processing"
+      echo "log file: $log_file"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+    echo "agent requested input (fail fast); requeueing: $log_label ($need_info_line)" >&2
+    rm -f "$tmp_prompt"
+    return 3
+  fi
+  
+  if [[ $retry_count -ge $max_retries ]]; then
+    # all retries exhausted
+    local error_summary=""
+    case "$error_category" in
+      rate_limit)
+        error_summary="rate limit exceeded after $max_retries attempts"
+        ;;
+      network_error)
+        error_summary="network errors persisted after $max_retries attempts"
+        ;;
+      api_error)
+        error_summary="API errors persisted after $max_retries attempts"
+        ;;
+      *)
+        error_summary="execution failed after $max_retries attempts"
+        ;;
+    esac
+    
+    # get additional context for better error reporting
+    local last_error_lines
+    last_error_lines="$(tail -n 30 "$log_file" 2>/dev/null | head -n 15 || echo "unable to read log file")"
+    local error_context=""
+    if [[ -f "$log_file" ]]; then
+      error_context="$(grep -iE "(error|exception|failed|fatal|rate limit|429|quota|timeout)" "$log_file" 2>/dev/null | tail -n 5 | head -c 500 || echo "")"
+    fi
+    
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "ERROR: $error_summary"
+      echo "error category: ${error_category:-unknown}"
+      echo "retry attempts: $retry_count/$max_retries"
+      echo "final backoff: ${backoff_secs}s"
+      echo "model: ${current_model:-default}"
+      echo "fallback attempted: ${use_fallback:-0}"
+      echo "task will be requeued for later processing"
+      echo "log file: $log_file"
+      echo ""
+      if [[ -n "$error_context" ]]; then
+        echo "error context:"
+        echo "$error_context"
+        echo ""
+      fi
+      echo "last log lines:"
+      echo "$last_error_lines"
+      echo ""
+      echo "troubleshooting:"
+      if [[ "$error_category" == "rate_limit" ]]; then
+        echo "  - check API quota/limits (may need to wait or upgrade plan)"
+        echo "  - consider increasing ORCHESTRATOR_BACKOFF_SECS (current: ${initial_backoff}s)"
+        echo "  - verify fallback model is configured (current: ${fallback_model:-none})"
+        echo "  - increase ORCHESTRATOR_MAX_RETRIES if needed (current: ${max_retries})"
+        echo "  - check ORCHESTRATOR_MAX_BACKOFF_SECS cap (current: ${max_backoff}s)"
+        echo "  - review rate limit frequency: ./agent_factory/log_search.sh 'rate limit' | wc -l"
+      elif [[ "$error_category" == "network_error" ]]; then
+        echo "  - check network connectivity: ping -c 3 api.cursor.com || curl -I https://api.cursor.com"
+        echo "  - verify API endpoint is accessible"
+        echo "  - check firewall/proxy settings"
+        echo "  - verify DNS resolution is working: nslookup api.cursor.com"
+        echo "  - check for network timeouts: timeout 10 curl -I https://api.cursor.com"
+      elif [[ "$error_category" == "api_error" ]]; then
+        echo "  - API service may be experiencing issues (check status page)"
+        echo "  - verify API key is valid and not expired: echo \$CURSOR_API_KEY"
+        echo "  - check for service maintenance windows"
+        echo "  - test API connectivity: curl -H 'Authorization: Bearer \$CURSOR_API_KEY' https://api.cursor.com/health"
+      elif [[ "$error_category" == "empty_output" ]]; then
+        echo "  - verify agent CLI is executable: ls -la $agent_bin"
+        echo "  - test agent CLI manually: echo 'test' | $agent_bin --print --force"
+        echo "  - check environment variables: env | grep -E '(PATH|HOME|LANG|CURSOR)'"
+        echo "  - review prompt file size: $(wc -c < "${tmp_prompt:-/dev/null}" 2>/dev/null | tr -d ' ' || echo "unknown") bytes"
+        echo "  - check for shell integration conflicts"
+      else
+        echo "  - review log file for specific error details: tail -50 $log_file"
+        echo "  - check agent CLI configuration and authentication"
+        echo "  - verify prompt file is valid and complete"
+        echo "  - check for syntax errors or malformed input"
+        echo "  - test agent CLI manually: echo 'test' | $agent_bin --print --force"
+      fi
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "$log_prefix_script" >> "$log_file"
+    echo "$error_summary: $log_label (see $log_file)" >&2
+    rm -f "$tmp_prompt"
+    return 1
+  fi
+  
   rm -f "$tmp_prompt"
 
-  if [[ ! -s "$log_file" ]]; then
-    echo "empty agent output: $log_label" >&2
+  # safety net: check for empty output (after successful execution)
+  # note: these checks are redundant if we detected issues in the retry loop (which would have returned early),
+  # but serve as a final validation before considering the task successful
+  local log_size
+  log_size="$(wc -c < "$log_file" 2>/dev/null | tr -d ' ' || echo "0")"
+  local log_lines
+  log_lines="$(wc -l < "$log_file" 2>/dev/null | tr -d ' ' || echo "0")"
+  
+  # enhanced content check: verify meaningful content exists
+  local has_meaningful_content="0"
+  if [[ -f "$log_file" ]] && [[ -r "$log_file" ]] && [[ "$log_size" -gt 0 ]]; then
+    local content_check
+    content_check="$(
+      python3 - "$log_file" <<'PY' 2>/dev/null || echo "0"
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+lines = path.read_text(errors="replace").splitlines()
+
+ts_rx = re.compile(r"^\\d{4}-\\d{2}-\\d{2}T[^ ]+\\s+")
+count = 0
+for line in lines:
+    line = ts_rx.sub("", line)
+    if not line.strip():
+        continue
+    if line.lstrip().startswith("━━"):
+        continue
+    count += 1
+
+print(count)
+PY
+    )"
+    if [[ "$content_check" -ge 3 ]]; then
+      has_meaningful_content="1"
+    fi
+  fi
+  
+  if [[ "$log_size" == "0" ]] || [[ "$log_lines" -lt 3 ]] || [[ "$has_meaningful_content" == "0" ]]; then
+    local agent_check=""
+    if [[ -x "$agent_bin" ]]; then
+      agent_check="executable"
+    else
+      agent_check="not executable or missing"
+    fi
+    local env_check=""
+    if [[ -n "${HOME:-}" ]] && [[ -n "${PATH:-}" ]]; then
+      env_check="HOME and PATH set"
+    else
+      env_check="missing HOME or PATH"
+    fi
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "WARNING: empty or minimal agent output detected"
+      echo "log file size: ${log_size} bytes, lines: ${log_lines}"
+      echo "has meaningful content: ${has_meaningful_content:-0}"
+      echo "agent binary: $agent_bin ($agent_check)"
+      echo "environment: $env_check"
+      echo "model: ${current_model:-default}"
+      echo ""
+      echo "this may indicate:"
+      echo "  - agent cli exited without producing output"
+      echo "  - environment configuration issue (check PATH, HOME, LANG)"
+      echo "  - prompt file was empty or malformed"
+      echo "  - agent CLI binary issue or permission problem"
+      echo "  - API authentication failure (silent exit)"
+      echo ""
+      echo "troubleshooting:"
+      echo "  - verify agent CLI is executable: $agent_bin"
+      echo "  - test agent CLI manually: echo 'test' | $agent_bin --print --force"
+      echo "  - check environment variables are set correctly"
+      echo "  - review prompt file size and content"
+      echo "  - check for shell integration conflicts"
+      echo "  - verify API key is valid and not expired"
+      echo ""
+      echo "task will be requeued for retry"
+      echo "log file: $log_file"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+    echo "empty agent output: $log_label (${log_size} bytes, ${log_lines} lines, see $log_file)" >&2
+    rm -f "$tmp_prompt"
     return 2
   fi
 
-  if grep -q "NEED-INFO:" "$log_file"; then
-    echo "agent requested input; requeueing: $log_label" >&2
+      # safety net: check for NEED-INFO responses (agent requesting additional information)
+      # note: this check is redundant if we detected NEED-INFO in the retry loop (which would have returned early),
+      # but serves as a final validation before considering the task successful
+      # enhanced detection: check for variations like "NEED-INFO", "NEED INFO", "need-info", etc.
+      if grep -qiE "NEED-INFO:|NEED INFO:|need-info:" "$log_file"; then
+    local need_info_line
+    need_info_line="$(grep -iE "NEED-INFO:" "$log_file" | head -1 | sed 's/^[[:space:]]*//' | head -c 300 || echo "NEED-INFO detected")"
+    local need_info_context=""
+    need_info_context="$(grep -iE "NEED-INFO:" "$log_file" -A 2 | head -3 | tail -2 | head -c 400 || echo "")"
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "INFO: agent requested additional information"
+      echo "request: $need_info_line"
+      if [[ -n "$need_info_context" ]]; then
+        echo ""
+        echo "context:"
+        echo "$need_info_context"
+      fi
+      echo ""
+      echo "action required:"
+      echo "  - review the agent's request in the log file"
+      echo "  - provide the requested information or update the task file"
+      echo "  - task will be requeued and processed again after information is available"
+      echo ""
+      echo "to prevent NEED-INFO responses:"
+      echo "  - ensure task files contain all required information"
+      echo "  - update agent profiles to explicitly forbid questions"
+      echo ""
+      echo "task will be requeued for later processing"
+      echo "log file: $log_file"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
+    echo "agent requested input; requeueing: $log_label ($need_info_line)" >&2
+    rm -f "$tmp_prompt"
     return 3
   fi
   
   if [[ "$use_fallback" == "1" ]]; then
     echo "successfully completed with fallback model: $fallback_model" >&2
+  fi
+  
+  # write model info to file if provided
+  if [[ -n "$model_info_file" ]]; then
+    {
+      echo "primary_model=${primary_model:-}"
+      echo "final_model=${current_model:-}"
+      echo "used_fallback=${use_fallback}"
+    } > "$model_info_file"
+  fi
+  
+  # rotate logs periodically (non-blocking, best-effort)
+  local log_rotate_script
+  log_rotate_script="$(pwd)/agent_factory/log_rotate.sh"
+  if [[ -f "$log_rotate_script" ]] && [[ -x "$log_rotate_script" ]]; then
+    "$log_rotate_script" >/dev/null 2>&1 &
   fi
 }
 
@@ -245,14 +1352,22 @@ spawn_once() {
 
 consume_queue() {
   local processed_dir="${queue_dir%/}/processed"
+  local queue_name
+  queue_name="$(basename "$queue_dir")"
   mkdir -p "$processed_dir"
-  local max_worker_pending="${MAX_WORKER_PENDING:-5}"
-  local judge_pause="${JUDGE_PAUSE_ON_PENDING:-1}"
-  local max_subplanner_pending="${MAX_SUBPLANNER_PENDING:-3}"
-  while true; do
+  local max_worker_pending="${MAX_WORKER_PENDING}"
+  local judge_pause="${JUDGE_PAUSE_ON_PENDING}"
+  local max_subplanner_pending="${MAX_SUBPLANNER_PENDING}"
+  local last_rotation_check="$(date +%s)"
+  local rotation_check_interval="${LOG_ROTATION_CHECK_INTERVAL_SECS}"
+  while [[ "$shutdown_requested" == "0" ]]; do
     local spawned="0"
     local task_file
     local IFS=$'\n'
+
+    if [[ "$shutdown_requested" == "1" ]]; then
+      break
+    fi
 
     # pause worker/subplanner when judge has pending work
     if [[ "$judge_pause" == "1" ]]; then
@@ -260,6 +1375,9 @@ consume_queue() {
       if [[ "$qbase" == "queue" || "$qbase" == "subplanner_queue" ]]; then
         judge_pending="$(find "tasks/judge_queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
         if [[ "$judge_pending" -gt 0 ]]; then
+          if [[ "$shutdown_requested" == "1" ]]; then
+            break
+          fi
           sleep "$sleep_secs"
           continue
         fi
@@ -270,6 +1388,9 @@ consume_queue() {
     if [[ "$(basename "$queue_dir")" == "subplanner_queue" ]]; then
       worker_pending="$(find "tasks/queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
       if [[ "$worker_pending" -ge "$max_worker_pending" ]]; then
+        if [[ "$shutdown_requested" == "1" ]]; then
+          break
+        fi
         sleep "$sleep_secs"
         continue
       fi
@@ -279,12 +1400,19 @@ consume_queue() {
     if [[ "$(basename "$queue_dir")" == "planner_queue" ]]; then
       subplanner_pending="$(find "tasks/subplanner_queue" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
       if [[ "$subplanner_pending" -ge "$max_subplanner_pending" ]]; then
+        if [[ "$shutdown_requested" == "1" ]]; then
+          break
+        fi
         sleep "$sleep_secs"
         continue
       fi
     fi
 
     for task_file in $(find "$queue_dir" -maxdepth 1 -type f -name '*.md' | sort); do
+      if [[ "$shutdown_requested" == "1" ]]; then
+        break
+      fi
+
       local base_name
       base_name="$(basename "$task_file")"
       local claimed_file
@@ -292,59 +1420,510 @@ consume_queue() {
       if ! mv "$task_file" "$claimed_file" 2>/dev/null; then
         continue
       fi
+      # ensure processed-time metrics are accurate (mv preserves mtime)
+      touch "$claimed_file" 2>/dev/null || true
+
+      current_claimed_file="$claimed_file"
+      
+      # check for shutdown before starting task
+      if [[ "$shutdown_requested" == "1" ]]; then
+        echo "shutdown requested before task start; requeueing: $base_name" >&2
+        mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+        current_claimed_file=""
+        break
+      fi
 
       # provenance snapshot (best-effort; requires git)
       local prov_start_ts
       prov_start_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      local prov_start_epoch
+      prov_start_epoch="$(date +%s)"
       local before_list
       before_list="$(mktemp)"
       local after_list
       after_list="$(mktemp)"
+      local model_info_file
+      model_info_file="$(mktemp)"
+      local git_commit_hash=""
+      local requeue_attempt=0
+      
+      # get git commit hash if available
       if [[ -d .git ]] && command -v git >/dev/null 2>&1; then
+        git_commit_hash="$(git rev-parse HEAD 2>/dev/null || echo "")"
         git status --porcelain 2>/dev/null | awk '{print $2}' | sort -u > "$before_list" || true
       else
         : > "$before_list"
       fi
+      
+      # check for existing provenance to track requeue attempts
+      # find most recent previous attempt (sorted by timestamp in filename)
+      local existing_prov
+      existing_prov="$(find "$processed_dir" -maxdepth 1 -name "${base_name}.*.provenance.json" 2>/dev/null | sort -r | head -1)"
+      local previous_provenance_file=""
+      if [[ -n "$existing_prov" && -f "$existing_prov" ]]; then
+        previous_provenance_file="$existing_prov"
+        requeue_attempt="$(python3 -c "import json, sys; d=json.load(open('$existing_prov')); print(d.get('requeue_attempt', 0) + 1)" 2>/dev/null || echo "1")"
+      fi
+      
       local tmp_prompt
       tmp_prompt="$(mktemp)"
-      cat "$profile" "$claimed_file" > "$tmp_prompt"
-      if ! spawn_with_file "$tmp_prompt" "$base_name"; then
+      local spawn_result
+      spawn_result=0
+      
+      # build prompt file with error handling
+      if ! cat "$profile" "$claimed_file" > "$tmp_prompt" 2>/dev/null; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: failed to build prompt file for $base_name" >&2
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
-        echo "failed to process: $base_name" >&2
-        rm -f "$before_list" "$after_list" || true
+        rm -f "$tmp_prompt" "$model_info_file" || true
+        current_claimed_file=""
         continue
       fi
-
+      
+      # validate prompt file was created and has content
+      if [[ ! -f "$tmp_prompt" ]] || [[ ! -s "$tmp_prompt" ]]; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: prompt file is empty or missing for $base_name" >&2
+        mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+        rm -f "$tmp_prompt" "$model_info_file" || true
+        current_claimed_file=""
+        continue
+      fi
+      
+      # run task and allow it to complete even if shutdown is requested
+      # capture exit code without crashing the loop
+      # use set +e to prevent loop crash on agent failures
+      # wrap in subshell to ensure errors don't propagate
+      # also capture stderr separately to detect errors even if exit code is 0
+      # use explicit error handling to ensure spawn_result is always set
+      # isolate errors to prevent orchestrator crash
+      # additional protection: ensure all error paths are handled gracefully
+      # ensure temporary files are cleaned up even on errors
+      set +e
+      local spawn_stderr
+      spawn_stderr="$(mktemp)"
+      local spawn_exit_file
+      spawn_exit_file="$(mktemp)"
+      spawn_result=1
+      
+      # ensure cleanup on exit (even if script is interrupted)
+      local cleanup_spawn_files=1
+      trap 'if [[ "${cleanup_spawn_files:-0}" == "1" ]]; then rm -f "${spawn_stderr:-}" "${spawn_exit_file:-}" 2>/dev/null || true; fi' EXIT
+      
+      # run spawn in background with timeout protection to prevent hang
+      # use explicit timeout to prevent orchestrator from hanging indefinitely
+      # ensure errors don't crash the orchestrator loop
+      local spawn_timeout="${AGENT_EXECUTION_TIMEOUT_SECS:-1800}"
+      spawn_timeout=$((spawn_timeout + 60))  # add buffer for cleanup
+      (
+        # ensure subshell errors don't propagate to parent
+        # this prevents the orchestrator loop from crashing on agent failures
+        set +e
+        # trap errors to ensure exit code is always captured
+        # catch all error conditions: ERR, EXIT, INT, TERM
+        trap 'local code=$?; echo "$code" > "$spawn_exit_file" 2>/dev/null || echo "1" > "$spawn_exit_file"; exit "$code"' ERR EXIT
+        trap 'echo "130" > "$spawn_exit_file" 2>/dev/null || true; exit 130' INT TERM
+        # run spawn_with_file with explicit error handling
+        # capture both exit code and any errors
+        # isolate errors to prevent orchestrator crash
+        local spawn_exit=1
+        base_label="${base_name%.md}"
+        if spawn_with_file "$tmp_prompt" "${queue_name}_${base_label}" "$model_info_file" 2>"$spawn_stderr"; then
+          spawn_exit=0
+        else
+          spawn_exit=$?
+          # log error for debugging (non-fatal, loop continues)
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) spawn_with_file returned exit code: $spawn_exit" >&2
+        fi
+        # ensure exit code is written even if trap doesn't fire
+        echo "$spawn_exit" > "$spawn_exit_file" 2>/dev/null || echo "1" > "$spawn_exit_file"
+        exit "$spawn_exit"
+      ) &
+      local spawn_pid=$!
+      
+      # validate spawn_pid is set and valid
+      if [[ -z "${spawn_pid:-}" ]] || ! [[ "$spawn_pid" =~ ^[0-9]+$ ]]; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: invalid spawn_pid, spawn process may have failed to start: $base_name" >&2
+        spawn_result=1
+        echo "1" > "$spawn_exit_file" 2>/dev/null || true
+        rm -f "$spawn_stderr" || true
+        mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+        current_claimed_file=""
+        continue
+      fi
+      
+      # validate spawn_pid is valid before proceeding
+      # wait briefly to ensure process started successfully
+      # use multiple checks to handle race conditions
+      local pid_check_count=0
+      local pid_check_max=5
+      local pid_valid="0"
+      while [[ $pid_check_count -lt $pid_check_max ]]; do
+        if kill -0 "$spawn_pid" 2>/dev/null; then
+          pid_valid="1"
+          break
+        fi
+        sleep 0.2
+        pid_check_count=$((pid_check_count + 1))
+      done
+      
+      if [[ "$pid_valid" == "0" ]]; then
+        # process failed to start or exited immediately
+        # check stderr for error details
+        local startup_error=""
+        if [[ -f "$spawn_stderr" ]] && [[ -s "$spawn_stderr" ]]; then
+          startup_error="$(head -5 "$spawn_stderr" 2>/dev/null | tr '\n' '; ' | head -c 300 || echo "")"
+        fi
+        
+        # also check if exit code file was created (process may have exited very quickly)
+        local quick_exit_code=""
+        if [[ -f "$spawn_exit_file" ]]; then
+          quick_exit_code="$(cat "$spawn_exit_file" 2>/dev/null || echo "")"
+        fi
+        
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: failed to start spawn process for $base_name" >&2
+        if [[ -n "$startup_error" ]]; then
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) startup error: $startup_error" >&2
+        fi
+        if [[ -n "$quick_exit_code" ]]; then
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) process exited immediately with code: $quick_exit_code" >&2
+        fi
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) troubleshooting: check agent binary ($agent_bin), workspace permissions, prompt file size, and environment variables" >&2
+        
+        spawn_result="${quick_exit_code:-1}"
+        if ! [[ "$spawn_result" =~ ^[0-9]+$ ]]; then
+          spawn_result=1
+        fi
+        echo "$spawn_result" > "$spawn_exit_file" 2>/dev/null || true
+        rm -f "$spawn_stderr" || true
+        mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+        current_claimed_file=""
+        continue
+      fi
+      
+      # wait for spawn with timeout to prevent orchestrator hang
+      # use kill -0 to check if process is still running
+      local spawn_wait_count=0
+      local spawn_wait_max=$spawn_timeout
+      local spawn_terminated="0"
+      while [[ "$spawn_terminated" == "0" ]] && [[ $spawn_wait_count -lt $spawn_wait_max ]]; do
+        # check if process is still running
+        if ! kill -0 "$spawn_pid" 2>/dev/null; then
+          spawn_terminated="1"
+          break
+        fi
+        # check for shutdown during wait
+        if [[ "$shutdown_requested" == "1" ]]; then
+          # allow spawn to complete naturally, but don't wait indefinitely
+          # calculate remaining shutdown timeout for grace period
+          local remaining_timeout="$shutdown_timeout"
+          if [[ -n "$shutdown_start_time" ]]; then
+            local elapsed
+            elapsed=$(($(date +%s) - shutdown_start_time))
+            remaining_timeout=$((shutdown_timeout - elapsed))
+            # ensure grace period is at least 5 seconds but not more than remaining timeout
+            if [[ $remaining_timeout -lt 5 ]]; then
+              remaining_timeout=5
+            fi
+          else
+            # fallback to 30 seconds if shutdown_start_time not set
+            remaining_timeout=30
+          fi
+          local grace_period="$remaining_timeout"
+          local grace_count=0
+          while kill -0 "$spawn_pid" 2>/dev/null && [[ $grace_count -lt $grace_period ]]; do
+            sleep 1
+            grace_count=$((grace_count + 1))
+            # check if overall shutdown timeout exceeded
+            if [[ -n "$shutdown_start_time" ]]; then
+              local elapsed
+              elapsed=$(($(date +%s) - shutdown_start_time))
+              if [[ $elapsed -ge $shutdown_timeout ]]; then
+                echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) shutdown timeout exceeded during task execution; forcing termination" >&2
+                break
+              fi
+            fi
+          done
+          if kill -0 "$spawn_pid" 2>/dev/null; then
+            # still running after grace period, terminate
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) spawn process still running after grace period; terminating: $base_name" >&2
+            kill -TERM "$spawn_pid" 2>/dev/null || true
+            sleep 2
+            if kill -0 "$spawn_pid" 2>/dev/null; then
+              kill -KILL "$spawn_pid" 2>/dev/null || true
+            fi
+          fi
+          spawn_terminated="1"
+          break
+        fi
+        sleep 1
+        spawn_wait_count=$((spawn_wait_count + 1))
+      done
+      
+      # if spawn is still running after timeout, kill it
+      if kill -0 "$spawn_pid" 2>/dev/null; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: spawn function exceeded timeout (${spawn_timeout}s), killing process: $base_name" >&2
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) timeout exceeded: task will be requeued for retry" >&2
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) troubleshooting: consider increasing AGENT_EXECUTION_TIMEOUT_SECS if task is legitimately long-running" >&2
+        # graceful termination first (SIGTERM)
+        kill -TERM "$spawn_pid" 2>/dev/null || true
+        sleep 2
+        # force kill if still running (SIGKILL)
+        if kill -0 "$spawn_pid" 2>/dev/null; then
+          kill -KILL "$spawn_pid" 2>/dev/null || true
+          sleep 1
+        fi
+        echo "124" > "$spawn_exit_file" 2>/dev/null || true
+      fi
+      
+      # wait for process to fully terminate (with timeout to prevent hang)
+      # use timeout to prevent infinite wait
+      local wait_timeout=5
+      local wait_count=0
+      while kill -0 "$spawn_pid" 2>/dev/null && [[ $wait_count -lt $wait_timeout ]]; do
+        sleep 1
+        wait_count=$((wait_count + 1))
+      done
+      wait "$spawn_pid" 2>/dev/null || true
+      
+      # final check: if process is still running, force kill
+      # this is a safety net for zombie processes or processes that didn't respond to SIGTERM
+      if kill -0 "$spawn_pid" 2>/dev/null; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: spawn process still running after wait, force killing: $base_name" >&2
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) process may be stuck or unresponsive; forcing termination" >&2
+        kill -KILL "$spawn_pid" 2>/dev/null || true
+        sleep 1
+        # verify process is actually terminated
+        if kill -0 "$spawn_pid" 2>/dev/null; then
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: process still running after SIGKILL; may require manual intervention" >&2
+        fi
+        echo "124" > "$spawn_exit_file" 2>/dev/null || true
+      fi
+      
+      # read exit code from file to avoid subshell exit code issues
+      # ensure we always have a valid exit code even if file operations fail
+      if [[ -f "$spawn_exit_file" ]]; then
+        spawn_result="$(cat "$spawn_exit_file" 2>/dev/null || echo "1")"
+        # validate exit code is numeric
+        if ! [[ "$spawn_result" =~ ^[0-9]+$ ]]; then
+          spawn_result=1
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: invalid exit code in spawn_exit_file, defaulting to 1: $base_name" >&2
+        fi
+        rm -f "$spawn_exit_file" || true
+      else
+        # if exit file wasn't created, spawn likely crashed or was killed
+        spawn_result=1
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: spawn exit code file not found, spawn may have crashed: $base_name" >&2
+      fi
+      set -e
+      
+      # check for errors in stderr even if exit code is 0
+      # log stderr for debugging and error detection
+      # enhanced error detection from stderr to catch errors that might not be in log file
+      # this ensures we catch all error conditions even if they don't propagate via exit code
+      if [[ -f "$spawn_stderr" ]] && [[ -s "$spawn_stderr" ]]; then
+        local stderr_content
+        stderr_content="$(cat "$spawn_stderr" 2>/dev/null || echo "")"
+        if [[ -n "$stderr_content" ]]; then
+          # check if stderr contains error patterns
+          local stderr_has_error="0"
+          local error_category_stderr=""
+          if echo "$stderr_content" | grep -qiE "(rate limit|429|quota|throttled|retry.*after)" 2>/dev/null; then
+            stderr_has_error="1"
+            error_category_stderr="rate_limit"
+            # if spawn_result is 0 but stderr has rate limit, treat as failure
+            if [[ "$spawn_result" == "0" ]]; then
+              spawn_result=1
+              echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: spawn returned success but stderr indicates rate limit, treating as failure: $base_name" >&2
+            fi
+          elif echo "$stderr_content" | grep -qiE "(timeout|timed out|exceeded.*time)" 2>/dev/null; then
+            stderr_has_error="1"
+            error_category_stderr="timeout"
+            # if spawn_result is 0 but stderr has timeout, treat as failure
+            if [[ "$spawn_result" == "0" ]]; then
+              spawn_result=4
+              echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: spawn returned success but stderr indicates timeout, treating as failure: $base_name" >&2
+            fi
+          elif echo "$stderr_content" | grep -qiE "(connection.*refused|connection.*reset|network.*error|502|503|504)" 2>/dev/null; then
+            stderr_has_error="1"
+            error_category_stderr="network_error"
+            # if spawn_result is 0 but stderr has network error, treat as failure
+            if [[ "$spawn_result" == "0" ]]; then
+              spawn_result=1
+              echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: spawn returned success but stderr indicates network error, treating as failure: $base_name" >&2
+            fi
+          elif echo "$stderr_content" | grep -qiE "(unauthorized|forbidden|401|403|authentication.*failed)" 2>/dev/null; then
+            stderr_has_error="1"
+            error_category_stderr="auth_error"
+            # auth errors are non-retryable, always treat as failure
+            spawn_result=1
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: authentication error detected in stderr (non-retryable): $base_name" >&2
+          elif echo "$stderr_content" | grep -qiE "(error|failed|exception|fatal)" 2>/dev/null; then
+            stderr_has_error="1"
+            error_category_stderr="execution_error"
+            # if spawn_result is 0 but stderr has errors, treat as failure
+            if [[ "$spawn_result" == "0" ]]; then
+              spawn_result=1
+              echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: spawn returned success but stderr contains error patterns, treating as failure: $base_name" >&2
+            fi
+          fi
+          
+          if [[ "$stderr_has_error" == "1" ]]; then
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: stderr contains error patterns from spawn: $base_name (category: ${error_category_stderr:-unknown})" >&2
+            echo "$stderr_content" | head -30 >&2 || true
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) troubleshooting: review stderr output above for specific error details" >&2
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) action: task will be requeued for retry (orchestrator loop continues)" >&2
+          else
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) INFO: stderr output from spawn (non-error): $base_name" >&2
+            echo "$stderr_content" | head -10 >&2 || true
+          fi
+        fi
+      fi
+      rm -f "$spawn_stderr" || true
+      
+      # ensure spawn_result is always set and valid (safety net)
+      # this prevents the orchestrator loop from crashing due to unset variables
+      if [[ -z "${spawn_result:-}" ]] || ! [[ "$spawn_result" =~ ^[0-9]+$ ]]; then
+        spawn_result=1
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: spawn_result was empty or invalid after execution, defaulting to 1: $base_name" >&2
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) spawn_result value was: '${spawn_result:-empty}'" >&2
+      fi
+      
+      # disable cleanup trap now that we've processed the result
+      cleanup_spawn_files=0
+      trap - EXIT
+      
+      # check for shutdown after task completion
+      if [[ "$shutdown_requested" == "1" ]]; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) shutdown requested; task completed, exiting after cleanup" >&2
+      fi
+      
+      # log spawn result for debugging with error category context
+      if [[ "$spawn_result" != "0" ]]; then
+        local error_type=""
+        case $spawn_result in
+          1) error_type="execution_failure" ;;
+          2) error_type="empty_output" ;;
+          3) error_type="need_info" ;;
+          4) error_type="timeout" ;;
+          *) error_type="unknown_error" ;;
+        esac
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) task execution returned code $spawn_result ($error_type): $base_name" >&2
+      fi
+      
+      # check shutdown timeout after task completes
+      if [[ "$shutdown_requested" == "1" && -n "$shutdown_start_time" ]]; then
+        local elapsed
+        elapsed=$(($(date +%s) - shutdown_start_time))
+        if [[ $elapsed -ge $shutdown_timeout ]]; then
+          echo "shutdown timeout exceeded (${elapsed}s > ${shutdown_timeout}s); forcing exit" >&2
+          break
+        fi
+      fi
+      
+      # capture end time and create provenance even for failures
       local prov_end_ts
       prov_end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      local prov_end_epoch
+      prov_end_epoch="$(date +%s)"
+      local execution_duration_secs
+      execution_duration_secs=$((prov_end_epoch - prov_start_epoch))
+      
       if [[ -d .git ]] && command -v git >/dev/null 2>&1; then
         git status --porcelain 2>/dev/null | awk '{print $2}' | sort -u > "$after_list" || true
       else
         : > "$after_list"
       fi
-
-      CLAIMED_FILE="$claimed_file" \
-      QUEUE_DIR="$queue_dir" \
-      TICKET_NAME="$base_name" \
-      START_TS="$prov_start_ts" \
-      END_TS="$prov_end_ts" \
-      BEFORE="$before_list" \
-      AFTER="$after_list" \
-      /usr/bin/python3 - <<'PY' > "${claimed_file}.provenance.json" 2>/dev/null || true
+      
+      # read model info from file
+      local primary_model_val=""
+      local final_model_val=""
+      local used_fallback_val="0"
+      if [[ -f "$model_info_file" ]]; then
+        primary_model_val="$(grep "^primary_model=" "$model_info_file" | cut -d= -f2- || echo "")"
+        final_model_val="$(grep "^final_model=" "$model_info_file" | cut -d= -f2- || echo "")"
+        used_fallback_val="$(grep "^used_fallback=" "$model_info_file" | cut -d= -f2- || echo "0")"
+      fi
+      
+      # create provenance for all outcomes (success and failure)
+      local error_code=""
+      local error_message=""
+      case $spawn_result in
+        0)
+          # success
+          ;;
+        2)
+          error_code="empty_output"
+          error_message="empty agent output detected"
+          ;;
+        3)
+          error_code="need_info"
+          error_message="agent requested additional information"
+          ;;
+        4)
+          error_code="timeout"
+          error_message="agent execution exceeded timeout (${AGENT_EXECUTION_TIMEOUT_SECS:-1800}s)"
+          ;;
+        *)
+          error_code="execution_failure"
+          error_message="agent execution failed (error code $spawn_result)"
+          ;;
+      esac
+      
+      # create provenance JSON with complete audit trail (non-blocking)
+      # includes: agent model (primary/final/fallback), execution duration, git commit hash,
+      # requeue attempt tracking, error information, and file change tracking
+      if ! CLAIMED_FILE="$claimed_file" \
+        QUEUE_DIR="$queue_dir" \
+        TICKET_NAME="$base_name" \
+        START_TS="$prov_start_ts" \
+        END_TS="$prov_end_ts" \
+        EXECUTION_DURATION_SECS="$execution_duration_secs" \
+        GIT_COMMIT_HASH="$git_commit_hash" \
+        PRIMARY_MODEL="$primary_model_val" \
+        FINAL_MODEL="$final_model_val" \
+        USED_FALLBACK="$used_fallback_val" \
+        REQUEUE_ATTEMPT="$requeue_attempt" \
+        PREVIOUS_PROVENANCE_FILE="$previous_provenance_file" \
+        ERROR_CODE="$error_code" \
+        ERROR_MESSAGE="$error_message" \
+        BEFORE="$before_list" \
+        AFTER="$after_list" \
+        python3 - <<'PY' > "${claimed_file}.provenance.json" 2>/dev/null
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 
 claimed_file = os.environ["CLAIMED_FILE"]
 queue_dir = os.environ["QUEUE_DIR"]
 ticket_name = os.environ["TICKET_NAME"]
 start_ts = os.environ["START_TS"]
 end_ts = os.environ["END_TS"]
+execution_duration_secs = int(os.environ.get("EXECUTION_DURATION_SECS", "0"))
+git_commit_hash = os.environ.get("GIT_COMMIT_HASH", "")
+primary_model = os.environ.get("PRIMARY_MODEL", "")
+final_model = os.environ.get("FINAL_MODEL", "")
+used_fallback = os.environ.get("USED_FALLBACK", "0") == "1"
+requeue_attempt = int(os.environ.get("REQUEUE_ATTEMPT", "0"))
+previous_provenance_file = os.environ.get("PREVIOUS_PROVENANCE_FILE", "")
+error_code = os.environ.get("ERROR_CODE", "")
+error_message = os.environ.get("ERROR_MESSAGE", "")
 before = Path(os.environ["BEFORE"]).read_text(errors="replace").splitlines()
 after = Path(os.environ["AFTER"]).read_text(errors="replace").splitlines()
 
 before_set = set([x for x in before if x.strip()])
 after_set = set([x for x in after if x.strip()])
+
+# calculate duration in human-readable format
+execution_duration_str = ""
+if execution_duration_secs < 60:
+    execution_duration_str = f"{execution_duration_secs}s"
+elif execution_duration_secs < 3600:
+    execution_duration_str = f"{execution_duration_secs // 60}m {execution_duration_secs % 60}s"
+else:
+    hours = execution_duration_secs // 3600
+    minutes = (execution_duration_secs % 3600) // 60
+    seconds = execution_duration_secs % 60
+    execution_duration_str = f"{hours}h {minutes}m {seconds}s"
 
 payload = {
     "ticket_name": ticket_name,
@@ -352,15 +1931,85 @@ payload = {
     "claimed_file": claimed_file,
     "start_ts_utc": start_ts,
     "end_ts_utc": end_ts,
+    "execution_duration_secs": execution_duration_secs,
+    "execution_duration": execution_duration_str,
+    "agent_model": {
+        "primary": primary_model,
+        "final": final_model,
+        "used_fallback": used_fallback,
+    },
+    "git_commit_hash": git_commit_hash,
+    "requeue_attempt": requeue_attempt,
     "git_dirty_before": sorted(before_set),
     "git_dirty_after": sorted(after_set),
     "newly_dirty_files": sorted(after_set - before_set),
     "cleared_files": sorted(before_set - after_set),
 }
+
+if previous_provenance_file:
+    payload["previous_attempt_provenance_file"] = previous_provenance_file
+
+if error_code:
+    payload["status"] = "failed"
+    payload["error_code"] = error_code
+    payload["error_message"] = error_message
+else:
+    payload["status"] = "success"
+
 print(json.dumps(payload, indent=2))
 PY
+      then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: failed to create provenance for $base_name" >&2
+      fi
+      
+      case $spawn_result in
+        0)
+          # success, continue processing
+          ;;
+        2)
+          # empty output: requeue for retry
+          mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+          echo "empty output detected; requeueing: $base_name" >&2
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          current_claimed_file=""
+          continue
+          ;;
+        3)
+          # NEED-INFO: requeue for later (after info is provided)
+          mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+          echo "NEED-INFO response; requeueing: $base_name" >&2
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          current_claimed_file=""
+          continue
+          ;;
+        4)
+          # timeout: requeue for retry
+          mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+          echo "execution timeout; requeueing: $base_name" >&2
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          current_claimed_file=""
+          continue
+          ;;
+        *)
+          # other errors (rate limit, execution failure): requeue for retry
+          mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+          echo "failed to process (error code $spawn_result); requeueing: $base_name" >&2
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          current_claimed_file=""
+          continue
+          ;;
+      esac
 
-      rm -f "$before_list" "$after_list" || true
+      # if shutdown was requested, exit gracefully (successful tasks are not requeued)
+      if [[ "$shutdown_requested" == "1" ]]; then
+        echo "shutdown requested after task completion; exiting gracefully" >&2
+        rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+        current_claimed_file=""
+        break
+      fi
+
+      rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+      current_claimed_file=""
       spawned=$((spawned + 1))
       if [[ "$spawned" -ge "$max_spawns" ]]; then
         break
@@ -369,8 +2018,36 @@ PY
     if [[ "$once" == "1" ]]; then
       break
     fi
+    if [[ "$shutdown_requested" == "1" ]]; then
+      break
+    fi
+    
+    # periodic log rotation check (every N seconds, non-blocking)
+    local now_epoch
+    now_epoch="$(date +%s)"
+    local time_since_last_check=$((now_epoch - last_rotation_check))
+    if [[ "$time_since_last_check" -ge "$rotation_check_interval" ]]; then
+      local log_rotate_script
+      log_rotate_script="$(pwd)/agent_factory/log_rotate.sh"
+      if [[ -f "$log_rotate_script" ]] && [[ -x "$log_rotate_script" ]]; then
+        "$log_rotate_script" >/dev/null 2>&1 &
+      fi
+      last_rotation_check="$now_epoch"
+    fi
+    
     sleep "$sleep_secs"
   done
+
+  if [[ -n "$current_claimed_file" && -f "$current_claimed_file" ]]; then
+    local base_name
+    base_name="$(basename "$current_claimed_file" | sed -E 's/\.[0-9]+\.[0-9]+$//')"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) shutdown during task; requeueing: $base_name" >&2
+    mv "$current_claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+  fi
+  
+  if [[ "$shutdown_requested" == "1" ]]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) orchestrator shutdown complete" >&2
+  fi
 }
 
 if [[ -n "$queue_dir" ]]; then

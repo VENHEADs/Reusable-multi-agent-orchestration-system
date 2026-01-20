@@ -10,14 +10,43 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-SLEEP_SECS="${SLEEP_SECS:-15}"
-MAX_WORKER_PENDING="${JUDGE_TRIGGER_MAX_WORKER_PENDING:-2}"
-COOLDOWN_SECS="${JUDGE_TRIGGER_COOLDOWN_SECS:-600}"
-PROCESSED_DELTA="${JUDGE_TRIGGER_PROCESSED_DELTA:-5}"
-STATE_DIR=".agent_factory_state"
+# load centralized configuration
+AGENT_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${AGENT_FACTORY_DIR}/config.sh" ]]; then
+  source "${AGENT_FACTORY_DIR}/config.sh"
+fi
+
+# use config values with backward compatibility
+# note: all defaults come from config.sh; these lines maintain backward compatibility with old env var names
+SLEEP_SECS="${JUDGE_TRIGGER_SLEEP_SECS:-${SLEEP_SECS}}"
+MAX_WORKER_PENDING="${JUDGE_TRIGGER_MAX_WORKER_PENDING}"
+COOLDOWN_SECS="${JUDGE_TRIGGER_COOLDOWN_SECS:-${COOLDOWN_SECS}}"
+PROCESSED_DELTA="${JUDGE_TRIGGER_PROCESSED_DELTA:-${PROCESSED_DELTA}}"
+STATE_DIR="${AGENT_FACTORY_STATE_DIR}"
 LAST_TRIGGER_FILE="${STATE_DIR}/judge_last_trigger_epoch"
 LAST_PROCESSED_FILE="${STATE_DIR}/worker_processed_count_at_last_judge"
-BLOCKER_TICKET_PATH="${BLOCKER_TICKET_PATH:-.agent_factory_state/judge_blocker.md}"
+BLOCKER_TICKET_PATH="${BLOCKER_TICKET_PATH}"
+
+shutdown_requested="0"
+shutdown_start_time=""
+shutdown_timeout="${SHUTDOWN_TIMEOUT_SECS}"
+
+shutdown_handler() {
+  if [[ "$shutdown_requested" == "0" ]]; then
+    shutdown_requested="1"
+    shutdown_start_time="$(date +%s)"
+    local signal_name=""
+    case "$1" in
+      SIGTERM) signal_name="SIGTERM" ;;
+      SIGINT) signal_name="SIGINT" ;;
+      *) signal_name="UNKNOWN" ;;
+    esac
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "shutdown signal received ($signal_name); finishing current check..."
+  fi
+}
+
+trap 'shutdown_handler SIGTERM' SIGTERM
+trap 'shutdown_handler SIGINT' SIGINT
 
 pending_md_count() {
   local dir="$1"
@@ -29,7 +58,7 @@ processed_count() {
 }
 
 git_is_effectively_dirty() {
-  /usr/bin/python3 - <<'PY'
+  python3 - <<'PY'
 import subprocess
 
 ignore_prefixes = ("logs/", "tasks/", "archive/", ".agent_factory_state/")
@@ -98,7 +127,7 @@ EOF
   echo "$now_processed" > "$LAST_PROCESSED_FILE"
 }
 
-while true; do
+while [[ "$shutdown_requested" == "0" ]]; do
   if [[ -d .git ]] && git_is_effectively_dirty; then
     # if a blocker exists, only re-run judge when there's new worker progress
     # (prevents spam, but stays automatic once fixes land).
@@ -120,5 +149,24 @@ while true; do
       fi
     fi
   fi
+  
+  if [[ "$shutdown_requested" == "1" ]]; then
+    break
+  fi
   sleep "$SLEEP_SECS"
 done
+
+# check shutdown timeout after loop exits
+if [[ "$shutdown_requested" == "1" && -n "$shutdown_start_time" ]]; then
+  local elapsed
+  elapsed=$(($(date +%s) - shutdown_start_time))
+  if [[ $elapsed -ge $shutdown_timeout ]]; then
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "shutdown timeout exceeded (${elapsed}s > ${shutdown_timeout}s); forcing exit"
+  fi
+fi
+
+if [[ "$shutdown_requested" == "1" ]]; then
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "judge trigger shutdown complete"
+else
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "judge trigger stopped"
+fi
