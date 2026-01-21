@@ -170,6 +170,10 @@ cat .agent_factory_state/judge_blocker.md
 - Configure fallback models to avoid rate limit delays
 - Monitor API usage via provenance
 
+**Fallback models (Cursor free-tier safe):**
+- Set `FALLBACK_MODEL="gpt-4o-mini"` to ensure fallback requests stay within free-tier availability
+- Keep the fallback model cheaper/faster than the default to reduce rate-limit impact
+
 **Throughput:**
 - Allow more pending tasks: `export MAX_WORKER_PENDING=10`
 - Disable judge pause if judge is fast: `export JUDGE_PAUSE_ON_PENDING=0`
