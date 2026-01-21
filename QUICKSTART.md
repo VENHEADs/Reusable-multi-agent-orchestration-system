@@ -16,7 +16,7 @@ cp -r /path/to/agent_factory .
 ```
 
 This creates:
-- `Agent_profiles/` with 4 agent templates (Primary Planner, Sub-Planner, Worker, Judge)
+- `Agent_profiles/` generated from `agent_factory/Agent_profiles/` templates (Primary Planner, Sub-Planner, Worker, Judge)
 - `tasks/` directory structure (planner_queue, subplanner_queue, queue, judge_queue)
 - `logs/` directory
 - launchd-based background commands (via `ops/agent_factory/`)

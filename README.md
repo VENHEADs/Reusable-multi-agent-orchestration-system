@@ -344,11 +344,12 @@ Or use launchd jobs (see "Scheduling" below).
 
 ### Components
 
-- **`orchestrator`**: Core script that spawns agents and manages queues
-- **`run_orchestrator`**: Wrapper that handles API key from macOS Keychain
-- **`Agent_profiles/`**: Markdown files defining agent behavior
-- **`goal_template.md`**: Template for goal file (source of truth)
-- **`launchd/`**: macOS launchd job templates for scheduling
+- **`agent_factory/orchestrator`**: Core script that spawns agents and manages queues
+- **`agent_factory/run_orchestrator`**: Wrapper that handles API key from macOS Keychain
+- **`Agent_profiles/`**: Markdown files defining agent behavior (created from templates)
+- **`agent_factory/Agent_profiles/`**: Template profiles for the 4-agent system
+- **`agent_factory/goal_template.md`**: Template for goal file (source of truth)
+- **`agent_factory/launchd/`**: macOS launchd job templates for scheduling
 
 ### Goal File (Source of Truth)
 
@@ -640,6 +641,7 @@ Configuration values are resolved in this order (highest to lowest priority):
 - `ORCHESTRATOR_MAX_BACKOFF_SECS`: maximum backoff delay cap (default: 300 seconds)
 - `AGENT_EXECUTION_TIMEOUT_SECS`: agent execution timeout in seconds (default: 1800 = 30 minutes)
 - `SHUTDOWN_TIMEOUT_SECS`: graceful shutdown timeout in seconds (default: 60)
+- `DEFAULT_MODEL`: default model name passed to agents (default: `gpt-5.2`)
 - `FALLBACK_MODEL`: fallback model name if rate limit hit (default: `gpt-5.2-codex-low`)
 
 **Judge Daemon:**
@@ -699,6 +701,7 @@ Or use stored auth (after `agent login`).
 - `AGENT_BIN`: Path to `agent` CLI (default: `~/.local/bin/agent`)
 - `CURSOR_API_KEY`: API key (if not using Keychain)
 - `CURSOR_KEYCHAIN_SERVICE`: Keychain service name (default: `cursor_cli_api_key`)
+- `DEFAULT_MODEL`: Default model name (default: from `config.sh`)
 - `FALLBACK_MODEL`: Fallback model name if rate limit hit (default: from `config.sh`, see Configuration section)
 
 ### Rate Limit Handling

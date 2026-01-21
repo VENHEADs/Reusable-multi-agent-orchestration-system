@@ -21,7 +21,7 @@ optional:
   --queue-dir <path>         consume task files from a queue directory
   --max <n>                  max tasks per loop (default: 1)
   --sleep <sec>              sleep between loops (default: 5)
-  --model <model>            model name passed to agent CLI
+  --model <model>            model name passed to agent CLI (default: from config.sh)
   --fallback-model <model>   fallback model if rate limit hit (default: from config.sh)
   --once                     process up to --max tasks then exit (queue mode only)
   --dry-run                  print commands without executing
@@ -30,6 +30,7 @@ optional:
 environment:
   AGENT_BIN                  agent CLI path (e.g., ~/.local/bin/agent)
   CURSOR_API_KEY             api key for authentication
+  DEFAULT_MODEL              default model name (default: from config.sh)
   FALLBACK_MODEL             fallback model name (default: from config.sh)
   
 configuration:
@@ -47,7 +48,7 @@ goal_file=""
 queue_dir=""
 max_spawns="${ORCHESTRATOR_MAX_SPAWNS}"
 sleep_secs="${ORCHESTRATOR_SLEEP_SECS}"
-model=""
+model="${DEFAULT_MODEL}"
 fallback_model="${FALLBACK_MODEL}"
 dry_run="0"
 once="0"
