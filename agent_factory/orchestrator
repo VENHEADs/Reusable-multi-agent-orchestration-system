@@ -2,7 +2,10 @@
 set -euo pipefail
 
 # load centralized configuration
+ORIGINAL_PWD="$(pwd)"
 AGENT_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${AGENT_FACTORY_DIR}/.." && pwd)"
+cd "$REPO_ROOT"
 if [[ -f "${AGENT_FACTORY_DIR}/config.sh" ]]; then
   source "${AGENT_FACTORY_DIR}/config.sh"
 fi
@@ -132,6 +135,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+resolve_path() {
+  local input_path="$1"
+  if [[ -z "$input_path" ]]; then
+    return 0
+  fi
+  if [[ "$input_path" = /* ]]; then
+    printf '%s' "$input_path"
+  else
+    printf '%s' "${ORIGINAL_PWD}/${input_path}"
+  fi
+}
+
+profile="$(resolve_path "$profile")"
+goal_file="$(resolve_path "$goal_file")"
+queue_dir="$(resolve_path "$queue_dir")"
+
 if [[ -z "$profile" ]]; then
   echo "--profile is required" >&2
   exit 2
@@ -191,7 +210,7 @@ spawn_with_file() {
   local run_date
   run_date="$(date -u +%Y-%m-%d)"
   local log_dir
-  log_dir="$(pwd)/${AGENT_RUNS_LOG_DIR}/${run_date}"
+  log_dir="${REPO_ROOT}/${AGENT_RUNS_LOG_DIR}/${run_date}"
   mkdir -p "$log_dir"
   if [[ -n "${LOG_LATEST_SYMLINK_NAME:-}" ]]; then
     ln -sfn "$log_dir" "$(pwd)/${AGENT_RUNS_LOG_DIR}/${LOG_LATEST_SYMLINK_NAME}" 2>/dev/null || true
@@ -223,7 +242,7 @@ spawn_with_file() {
   fi
 
   local log_prefix_script
-  log_prefix_script="$(pwd)/agent_factory/log_prefix.py"
+  log_prefix_script="${AGENT_FACTORY_DIR}/log_prefix.py"
   : > "$log_file"
 
   # pass the prompt via stdin to avoid argv size limits for large goal/task files
@@ -1341,7 +1360,7 @@ PY
   
   # rotate logs periodically (non-blocking, best-effort)
   local log_rotate_script
-  log_rotate_script="$(pwd)/agent_factory/log_rotate.sh"
+  log_rotate_script="${AGENT_FACTORY_DIR}/log_rotate.sh"
   if [[ -f "$log_rotate_script" ]] && [[ -x "$log_rotate_script" ]]; then
     "$log_rotate_script" >/dev/null 2>&1 &
   fi
@@ -2029,7 +2048,7 @@ PY
     local time_since_last_check=$((now_epoch - last_rotation_check))
     if [[ "$time_since_last_check" -ge "$rotation_check_interval" ]]; then
       local log_rotate_script
-      log_rotate_script="$(pwd)/agent_factory/log_rotate.sh"
+      log_rotate_script="${AGENT_FACTORY_DIR}/log_rotate.sh"
       if [[ -f "$log_rotate_script" ]] && [[ -x "$log_rotate_script" ]]; then
         "$log_rotate_script" >/dev/null 2>&1 &
       fi
