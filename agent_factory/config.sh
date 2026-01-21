@@ -104,7 +104,7 @@ CURSOR_API_KEY="${CURSOR_API_KEY:-}"
 DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-5.2}"
 
 # fallback model name if rate limit hit
-FALLBACK_MODEL="${FALLBACK_MODEL:-gpt-5.2-codex-low}"
+FALLBACK_MODEL="${FALLBACK_MODEL:-gpt-4o-mini}"
 
 # max retries for agent execution
 ORCHESTRATOR_MAX_RETRIES="${ORCHESTRATOR_MAX_RETRIES:-3}"
