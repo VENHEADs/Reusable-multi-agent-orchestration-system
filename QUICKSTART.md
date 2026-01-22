@@ -169,6 +169,7 @@ agent status
 agent login
 # Or store API key in Keychain:
 security add-generic-password -a "$USER" -s "cursor_cli_api_key" -w
+security add-generic-password -a "$USER" -s "antigravity_cli_api_key" -w
 ```
 
 **Empty output / NEED-INFO:**

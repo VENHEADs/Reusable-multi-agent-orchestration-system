@@ -691,10 +691,15 @@ Old variable names still work, but new projects should use the centralized confi
 
 ### API Key (macOS Keychain)
 
-Store your Cursor API key in Keychain:
+Store your API key in Keychain for the provider you use:
 
 ```bash
 security add-generic-password -a "$USER" -s "cursor_cli_api_key" -w
+# Paste your API key when prompted
+```
+
+```bash
+security add-generic-password -a "$USER" -s "antigravity_cli_api_key" -w
 # Paste your API key when prompted
 ```
 
@@ -703,8 +708,11 @@ Or use stored auth (after `agent login`).
 ### Environment Variables
 
 - `AGENT_BIN`: Path to `agent` CLI (default: `~/.local/bin/agent`)
-- `CURSOR_API_KEY`: API key (if not using Keychain)
-- `CURSOR_KEYCHAIN_SERVICE`: Keychain service name (default: `cursor_cli_api_key`)
+- `AGENT_PROVIDER`: Provider selection (`cursor` or `antigravity`, default: `cursor`)
+- `CURSOR_API_KEY`: Cursor API key (if not using Keychain)
+- `ANTIGRAVITY_API_KEY`: Antigravity API key (if not using Keychain)
+- `CURSOR_KEYCHAIN_SERVICE`: Cursor keychain service name (default: `cursor_cli_api_key`)
+- `ANTIGRAVITY_KEYCHAIN_SERVICE`: Antigravity keychain service name (default: `antigravity_cli_api_key`)
 - `DEFAULT_MODEL`: Default model name (default: from `config.sh`)
 - `FALLBACK_MODEL`: Fallback model name if rate limit hit (default: from `config.sh`, see Configuration section)
 

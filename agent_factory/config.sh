@@ -97,8 +97,14 @@ JUDGE_PAUSE_ON_PENDING="${JUDGE_PAUSE_ON_PENDING:-1}"
 # agent CLI path (default: from $AGENT_BIN or PATH)
 AGENT_BIN="${AGENT_BIN:-}"
 
+# agent provider (cursor or antigravity)
+AGENT_PROVIDER="${AGENT_PROVIDER:-cursor}"
+
 # cursor API key (default: from $CURSOR_API_KEY)
 CURSOR_API_KEY="${CURSOR_API_KEY:-}"
+
+# antigravity API key (default: from $ANTIGRAVITY_API_KEY)
+ANTIGRAVITY_API_KEY="${ANTIGRAVITY_API_KEY:-}"
 
 # default model name passed to agent CLI (override via --model or DEFAULT_MODEL)
 DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-5.2}"
