@@ -19,7 +19,8 @@ required:
 
 optional:
   --agent-bin <path>         agent CLI path (default: from $AGENT_BIN or PATH)
-  --api-key <key>            Cursor API key (default: from $CURSOR_API_KEY)
+  --provider <name>          provider to use: cursor or antigravity (default: from $AGENT_PROVIDER)
+  --api-key <key>            API key (default: from provider env var)
   --goal-file <path>         goal file (source of truth, prepended to all prompts)
   --queue-dir <path>         consume task files from a queue directory
   --max <n>                  max tasks per loop (default: 1)
@@ -32,7 +33,9 @@ optional:
 
 environment:
   AGENT_BIN                  agent CLI path (e.g., ~/.local/bin/agent)
-  CURSOR_API_KEY             api key for authentication
+  AGENT_PROVIDER             provider: cursor or antigravity
+  CURSOR_API_KEY             cursor api key for authentication
+  ANTIGRAVITY_API_KEY         antigravity api key for authentication
   DEFAULT_MODEL              default model name (default: from config.sh)
   FALLBACK_MODEL             fallback model name (default: from config.sh)
   
@@ -46,7 +49,8 @@ EOF
 
 profile=""
 agent_bin="${AGENT_BIN:-}"
-api_key="${CURSOR_API_KEY:-}"
+provider="${AGENT_PROVIDER:-cursor}"
+api_key=""
 goal_file=""
 queue_dir=""
 max_spawns="${ORCHESTRATOR_MAX_SPAWNS}"
@@ -95,6 +99,10 @@ while [[ $# -gt 0 ]]; do
       agent_bin="$2"
       shift 2
       ;;
+    --provider)
+      provider="$2"
+      shift 2
+      ;;
     --api-key)
       api_key="$2"
       shift 2
@@ -135,6 +143,25 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+normalize_provider() {
+  local input="$1"
+  case "$input" in
+    anti-gravity) printf '%s' "antigravity" ;;
+    antigravity|cursor) printf '%s' "$input" ;;
+    *) printf '%s' "$input" ;;
+  esac
+}
+
+provider="$(normalize_provider "$provider")"
+case "$provider" in
+  cursor|antigravity)
+    ;;
+  *)
+    echo "unknown provider: $provider (expected: cursor or antigravity)" >&2
+    exit 2
+    ;;
+esac
+
 resolve_path() {
   local input_path="$1"
   if [[ -z "$input_path" ]]; then
@@ -173,6 +200,17 @@ fi
 if [[ -z "$agent_bin" || ! -x "$agent_bin" ]]; then
   echo "agent cli not found; set --agent-bin or AGENT_BIN" >&2
   exit 2
+fi
+
+if [[ -z "$api_key" ]]; then
+  case "$provider" in
+    cursor)
+      api_key="${CURSOR_API_KEY:-}"
+      ;;
+    antigravity)
+      api_key="${ANTIGRAVITY_API_KEY:-}"
+      ;;
+  esac
 fi
 
 spawn_with_file() {
