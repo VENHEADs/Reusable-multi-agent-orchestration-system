@@ -14,3 +14,7 @@ tasks/
 # os
 .DS_Store
 
+# env files
+.env
+.env.*
+.envrc

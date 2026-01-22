@@ -8,6 +8,8 @@ Reusable multi-agent orchestration system based on the [Cursor "Scaling Agents" 
 - [Quick Start](#quick-start) - Setup and basic usage
 - [Best Practices - Getting Started](#getting-started-step-by-step) - Step-by-step guide for new projects
 - [Quick Reference Cheat Sheet](#quick-reference-cheat-sheet) - Essential commands and patterns
+- [Security Policy](SECURITY.md) - How to report security issues
+- [License](LICENSE) - Project licensing details
 
 **Core Documentation:**
 - [Architecture](#architecture) - System components and design
