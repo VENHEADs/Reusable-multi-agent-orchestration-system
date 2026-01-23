@@ -9,6 +9,9 @@ Reusable multi-agent orchestration system based on the [Cursor "Scaling Agents" 
 - [Best Practices - Getting Started](#getting-started-step-by-step) - Step-by-step guide for new projects
 - [Quick Reference Cheat Sheet](#quick-reference-cheat-sheet) - Essential commands and patterns
 - [Security Policy](SECURITY.md) - How to report security issues
+- [Contributing](CONTRIBUTING.md) - How to propose changes
+- [Code of Conduct](CODE_OF_CONDUCT.md) - Community standards
+- [Support](SUPPORT.md) - Where to get help
 - [License](LICENSE) - Project licensing details
 
 **Core Documentation:**
@@ -86,6 +89,13 @@ This README provides comprehensive documentation covering all essential aspects 
   - Development/testing configuration
 
 All documentation is cross-referenced and includes practical examples, code snippets, and actionable guidance.
+
+## Community
+
+We welcome issues and pull requests! Please review the following before contributing:
+- [Contributing Guide](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Support](SUPPORT.md)
 
 ## Quick Reference Cheat Sheet
 
