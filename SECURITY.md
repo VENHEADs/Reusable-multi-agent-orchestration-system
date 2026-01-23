@@ -4,7 +4,10 @@
 
 Please report security issues privately and do not open public GitHub issues.
 
-Send a report to: **security@example.com**
+Send a report to: **security@your-domain.example**
+
+If you are publishing this repository, replace the email above with a
+monitored security inbox before launch.
 
 Include the following information to help us validate and fix the issue:
 - A clear description of the vulnerability and potential impact.
