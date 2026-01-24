@@ -1,6 +1,15 @@
 # Agent Factory
 
+[![License](https://img.shields.io/badge/license-MIT-brightgreen.svg)](LICENSE)
+[![Code of Conduct](https://img.shields.io/badge/code%20of%20conduct-enforced-4baaaa.svg)](CODE_OF_CONDUCT.md)
+[![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](SECURITY.md)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 Reusable multi-agent orchestration system based on the [Cursor "Scaling Agents" architecture](https://cursor.com/blog/scaling-agents). Supports both single-agent sequential execution and multi-agent concurrent workflows.
+
+## Project Status
+
+**Status:** Active maintenance with ongoing improvements and community contributions welcome. See the [Support guide](SUPPORT.md) and [Security policy](SECURITY.md) for the best ways to engage.
 
 ## Documentation Quick Links
 
