@@ -33,7 +33,7 @@ fi
 user_id="$(id -u)"
 
 echo "launchd status for project: ${project_id}"
-for role in primary_planner sub_planner worker judge judge_trigger; do
+for role in primary_planner sub_planner worker judge judge_trigger watchdog; do
   label="com.${project_id}.agent_factory.${role}"
   echo
   echo "== ${label}"

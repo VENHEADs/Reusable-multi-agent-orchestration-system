@@ -79,6 +79,19 @@ Build feature X that does Y.
 EOF
 ```
 
+Optional task headers (execution mode, rate limit, priority):
+
+```markdown
+# Task: Quick API call
+# execution: direct_bash
+# rate_limit: 20
+# priority: high
+
+```bash
+curl -H "Authorization: Bearer ${API_KEY}" https://api.example.com/health
+```
+```
+
 ### 6. Run the agent
 
 ```bash
@@ -100,6 +113,7 @@ EOF
 ```
 
 note: `start.sh` will fail non-zero if launchd jobs are not loaded correctly.
+Use `./agent_factory/health_check.sh` to get a JSON health snapshot (including watchdog status).
 
 **Updating the goal**: Edit `goal.md` anytime. The next agent run will automatically see the updated goal.
 

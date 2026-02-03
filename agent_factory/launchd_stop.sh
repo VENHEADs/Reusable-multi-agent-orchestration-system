@@ -69,7 +69,7 @@ fi
 
 # stop the canonical role plists (and optionally remove them)
 # launchctl bootout sends SIGTERM, which our scripts handle gracefully
-for role in primary_planner sub_planner worker judge judge_trigger; do
+for role in primary_planner sub_planner worker judge judge_trigger watchdog; do
   label="com.${project_id}.agent_factory.${role}"
   plist_path="${launch_agents_dir}/${label}.plist"
 
@@ -92,7 +92,7 @@ elapsed=0
 echo "waiting for graceful shutdown (timeout: ${timeout}s)..." >&2
 while [[ $elapsed -lt $timeout ]]; do
   remaining_labels=""
-  for role in primary_planner sub_planner worker judge judge_trigger; do
+  for role in primary_planner sub_planner worker judge judge_trigger watchdog; do
     label="com.${project_id}.agent_factory.${role}"
     if launchctl print "gui/${user_id}/${label}" >/dev/null 2>&1; then
       remaining_labels="${remaining_labels}${label}\n"
@@ -116,7 +116,7 @@ done
 if [[ $elapsed -ge $timeout ]]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) warning: graceful shutdown timeout exceeded (${elapsed}s); some jobs may still be running" >&2
   # list remaining jobs for debugging
-  for role in primary_planner sub_planner worker judge judge_trigger; do
+  for role in primary_planner sub_planner worker judge judge_trigger watchdog; do
     label="com.${project_id}.agent_factory.${role}"
     if launchctl print "gui/${user_id}/${label}" >/dev/null 2>&1; then
       echo "  still running: ${label}" >&2

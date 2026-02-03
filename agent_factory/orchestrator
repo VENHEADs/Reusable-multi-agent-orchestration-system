@@ -57,12 +57,17 @@ max_spawns="${ORCHESTRATOR_MAX_SPAWNS}"
 sleep_secs="${ORCHESTRATOR_SLEEP_SECS}"
 model="${DEFAULT_MODEL}"
 fallback_model="${FALLBACK_MODEL}"
+model_chain="${MODEL_CHAIN:-}"
+model_rate_limit_backoff="${MODEL_RATE_LIMIT_BACKOFF_SECS:-60}"
 dry_run="0"
 once="0"
 shutdown_requested="0"
 current_claimed_file=""
 shutdown_timeout="${SHUTDOWN_TIMEOUT_SECS}"
 shutdown_start_time=""
+spawn_last_error_category=""
+spawn_last_log_file=""
+spawn_last_exit_code=""
 
 shutdown_handler() {
   if [[ "$shutdown_requested" == "0" ]]; then
@@ -174,9 +179,207 @@ resolve_path() {
   fi
 }
 
+log_ts() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
+}
+
+load_credentials() {
+  local global_creds="${HOME}/.config/agent_factory/credentials.json"
+  local local_creds="${REPO_ROOT}/credentials/secrets.json"
+  local creds_payload=""
+
+  if [[ -f "$global_creds" ]] || [[ -f "$local_creds" ]]; then
+    creds_payload="$(
+      python3 - "$global_creds" "$local_creds" <<'PY' 2>/dev/null || echo ""
+import json
+import os
+import sys
+import shlex
+
+def read_json(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+global_path = sys.argv[1] if len(sys.argv) > 1 else ""
+local_path = sys.argv[2] if len(sys.argv) > 2 else ""
+
+merged = {}
+merged.update(read_json(global_path))
+merged.update(read_json(local_path))
+
+for key, value in merged.items():
+    if not isinstance(key, str):
+        continue
+    if value is None:
+        continue
+    value_str = str(value)
+    print(f"export {key}={shlex.quote(value_str)}")
+PY
+    )"
+  fi
+
+  if [[ -n "$creds_payload" ]]; then
+    # shellcheck disable=SC1090
+    eval "$creds_payload"
+  fi
+}
+
+substitute_credentials() {
+  local input_file="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  if command -v envsubst >/dev/null 2>&1; then
+    envsubst < "$input_file" > "$tmp_file"
+  else
+    python3 - "$input_file" "$tmp_file" <<'PY' 2>/dev/null || cp "$input_file" "$tmp_file"
+import os
+import re
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+dest_path = Path(sys.argv[2])
+content = source_path.read_text(errors="replace")
+
+def replacer(match):
+    key = match.group(1)
+    return os.environ.get(key, match.group(0))
+
+content = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", replacer, content)
+dest_path.write_text(content)
+PY
+  fi
+  printf '%s' "$tmp_file"
+}
+
+get_execution_mode() {
+  local task_file="$1"
+  local mode
+  mode="$(grep -m1 "^# execution:" "$task_file" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || true)"
+  if [[ -z "$mode" ]]; then
+    mode="$DEFAULT_EXECUTION_MODE"
+  fi
+  printf '%s' "$mode"
+}
+
+get_task_priority_value() {
+  local task_file="$1"
+  local header_priority=""
+  header_priority="$(grep -m1 "^# priority:" "$task_file" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' || true)"
+  case "$header_priority" in
+    critical) printf '%s' "0" ;;
+    high) printf '%s' "10" ;;
+    normal) printf '%s' "50" ;;
+    low) printf '%s' "90" ;;
+    *) 
+      local base_name
+      base_name="$(basename "$task_file")"
+      if [[ "$base_name" =~ ^([0-9][0-9])_ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+      else
+        printf '%s' "50"
+      fi
+      ;;
+  esac
+}
+
+get_task_rate_limit() {
+  local task_file="$1"
+  local rate_limit=""
+  rate_limit="$(grep -m1 "^# rate_limit:" "$task_file" 2>/dev/null | cut -d: -f2 | tr -d '[:space:]' || true)"
+  if [[ -n "$rate_limit" ]] && [[ "$rate_limit" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$rate_limit"
+    return
+  fi
+  printf '%s' ""
+}
+
+get_next_task() {
+  local queue_path="$1"
+  local candidates=()
+  local task_file
+  while IFS= read -r task_file; do
+    candidates+=("$task_file")
+  done < <(find "$queue_path" -maxdepth 1 -type f -name '*.md' 2>/dev/null | sort)
+
+  if [[ "${#candidates[@]}" -eq 0 ]]; then
+    printf '%s' ""
+    return
+  fi
+
+  local best_task=""
+  local best_priority=""
+  for task_file in "${candidates[@]}"; do
+    local priority
+    priority="$(get_task_priority_value "$task_file")"
+    if [[ -z "$best_task" ]] || [[ "$priority" -lt "$best_priority" ]] || [[ "$priority" == "$best_priority" && "$task_file" < "$best_task" ]]; then
+      best_task="$task_file"
+      best_priority="$priority"
+    fi
+  done
+  printf '%s' "$best_task"
+}
+
+replenish_queue() {
+  local queue_path="$1"
+  local min_size="$2"
+  local seed_dir="$3"
+  local shuffle="${4:-1}"
+
+  if [[ ! -d "$seed_dir" ]]; then
+    return 0
+  fi
+
+  local queue_count
+  queue_count="$(find "$queue_path" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$queue_count" -lt "$min_size" ]]; then
+    local seed_files=()
+    while IFS= read -r seed_file; do
+      seed_files+=("$seed_file")
+    done < <(find "$seed_dir" -maxdepth 1 -type f -name '*.md' 2>/dev/null)
+
+    if [[ "${#seed_files[@]}" -eq 0 ]]; then
+      return 0
+    fi
+
+    if [[ "$shuffle" == "1" ]] && command -v shuf >/dev/null 2>&1; then
+      printf '%s\n' "${seed_files[@]}" | shuf | head -n 10 | while IFS= read -r seed_file; do
+        cp "$seed_file" "$queue_path/" 2>/dev/null || true
+      done
+    else
+      for seed_file in "${seed_files[@]}"; do
+        cp "$seed_file" "$queue_path/" 2>/dev/null || true
+      done
+    fi
+    log_ts "replenished queue from seeds: ${queue_path}"
+  fi
+}
+
+set_spawn_status() {
+  spawn_last_error_category="$1"
+  spawn_last_exit_code="$2"
+  spawn_last_log_file="${3:-}"
+}
+
+sleep_for_rate_limit() {
+  local rate_limit="$1"
+  if [[ -n "$rate_limit" ]]; then
+    log_ts "rate_limit header detected (${rate_limit}s); sleeping after task"
+    sleep "$rate_limit"
+  fi
+}
+
 profile="$(resolve_path "$profile")"
 goal_file="$(resolve_path "$goal_file")"
 queue_dir="$(resolve_path "$queue_dir")"
+
+load_credentials
 
 if [[ -z "$profile" ]]; then
   echo "--profile is required" >&2
@@ -241,6 +444,7 @@ spawn_with_file() {
   if [[ "$dry_run" == "1" ]]; then
     echo "$agent_bin --print --force --api-key '***' --workspace '$(pwd)' ${model:+--model $model }'<prompt from $tmp_prompt (includes goal file if provided)>'"
     rm -f "$tmp_prompt"
+    set_spawn_status "dry_run" "0" ""
     return 0
   fi
   local run_ts
@@ -255,6 +459,7 @@ spawn_with_file() {
   fi
   local log_file
   log_file="$log_dir/${run_ts}_${log_label}.log"
+  set_spawn_status "" "0" "$log_file"
 
   # try with primary model first
   local current_model="${model:-}"
@@ -405,6 +610,7 @@ spawn_with_file() {
       local exec_duration=$((exec_end - exec_start))
       echo "agent execution timed out after ${exec_duration}s (timeout: ${timeout_secs}s): $log_label" >&2
       rm -f "$tmp_prompt"
+      set_spawn_status "timeout" "4" "$log_file"
       return 4
     fi
     
@@ -1142,6 +1348,7 @@ spawn_with_file() {
     } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
     echo "empty agent output (fail fast): $log_label (see $log_file)" >&2
     rm -f "$tmp_prompt"
+    set_spawn_status "empty_output" "2" "$log_file"
     return 2
   fi
   
@@ -1166,6 +1373,7 @@ spawn_with_file() {
     } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
     echo "agent requested input (fail fast); requeueing: $log_label ($need_info_line)" >&2
     rm -f "$tmp_prompt"
+    set_spawn_status "need_info" "3" "$log_file"
     return 3
   fi
   
@@ -1252,6 +1460,7 @@ spawn_with_file() {
     } | python3 "$log_prefix_script" >> "$log_file"
     echo "$error_summary: $log_label (see $log_file)" >&2
     rm -f "$tmp_prompt"
+    set_spawn_status "${error_category:-execution_failure}" "1" "$log_file"
     return 1
   fi
   
@@ -1341,6 +1550,7 @@ PY
     } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
     echo "empty agent output: $log_label (${log_size} bytes, ${log_lines} lines, see $log_file)" >&2
     rm -f "$tmp_prompt"
+    set_spawn_status "empty_output" "2" "$log_file"
     return 2
   fi
 
@@ -1380,8 +1590,11 @@ PY
     } | python3 "$log_prefix_script" >> "$log_file" 2>/dev/null || true
     echo "agent requested input; requeueing: $log_label ($need_info_line)" >&2
     rm -f "$tmp_prompt"
+    set_spawn_status "need_info" "3" "$log_file"
     return 3
   fi
+
+  set_spawn_status "" "0" "$log_file"
   
   if [[ "$use_fallback" == "1" ]]; then
     echo "successfully completed with fallback model: $fallback_model" >&2
@@ -1408,6 +1621,146 @@ spawn_once() {
   spawn_with_file "$profile" "$(basename "$profile")"
 }
 
+extract_bash_block() {
+  local task_file="$1"
+  sed -n '/^```bash/,/^```/p' "$task_file" 2>/dev/null | sed '1d;$d'
+}
+
+execute_task_agent_cli() {
+  local prompt_file="$1"
+  local log_label="$2"
+  local model_info_file="$3"
+  local original_model="$model"
+  local original_fallback="$fallback_model"
+
+  if [[ -n "${model_chain:-}" ]]; then
+    local chain_item
+    IFS=',' read -ra chain_items <<< "$model_chain"
+    for chain_item in "${chain_items[@]}"; do
+      chain_item="$(echo "$chain_item" | tr -d '[:space:]')"
+      [[ -z "$chain_item" ]] && continue
+      model="$chain_item"
+      fallback_model=""
+      if spawn_with_file "$prompt_file" "$log_label" "$model_info_file"; then
+        model="$original_model"
+        fallback_model="$original_fallback"
+        return 0
+      fi
+      if [[ "$spawn_last_error_category" == "rate_limit" ]]; then
+        log_ts "rate limit detected for model ${chain_item}; backing off ${model_rate_limit_backoff}s before next model"
+        sleep "$model_rate_limit_backoff"
+        continue
+      fi
+      model="$original_model"
+      fallback_model="$original_fallback"
+      return "$spawn_last_exit_code"
+    done
+    model="$original_model"
+    fallback_model="$original_fallback"
+    return 1
+  fi
+
+  spawn_with_file "$prompt_file" "$log_label" "$model_info_file"
+}
+
+execute_task_direct_bash() {
+  local task_file="$1"
+  local log_label="$2"
+  local run_ts
+  run_ts="$(date -u +%Y%m%d_%H%M%S)"
+  local run_date
+  run_date="$(date -u +%Y-%m-%d)"
+  local log_dir
+  log_dir="${REPO_ROOT}/${AGENT_RUNS_LOG_DIR}/${run_date}"
+  mkdir -p "$log_dir"
+  if [[ -n "${LOG_LATEST_SYMLINK_NAME:-}" ]]; then
+    ln -sfn "$log_dir" "$(pwd)/${AGENT_RUNS_LOG_DIR}/${LOG_LATEST_SYMLINK_NAME}" 2>/dev/null || true
+  fi
+  local log_file
+  log_file="$log_dir/${run_ts}_${log_label}.log"
+  set_spawn_status "" "0" "$log_file"
+
+  local script_content
+  script_content="$(extract_bash_block "$task_file")"
+  if [[ -z "$script_content" ]]; then
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "ERROR: direct_bash execution requested but no bash code block found"
+      echo "task file: $task_file"
+      echo "expected format: ```bash ... ```"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "${AGENT_FACTORY_DIR}/log_prefix.py" >> "$log_file" 2>/dev/null || true
+    set_spawn_status "direct_bash_missing" "1" "$log_file"
+    return 1
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    {
+      echo ""
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "DRY RUN: direct_bash execution for $task_file"
+      echo "script:"
+      echo "$script_content"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+    } | python3 "${AGENT_FACTORY_DIR}/log_prefix.py" >> "$log_file" 2>/dev/null || true
+    set_spawn_status "dry_run" "0" "$log_file"
+    return 0
+  fi
+
+  local timeout_secs="${DIRECT_BASH_TIMEOUT_SECS:-60}"
+  local exit_code=0
+  if command -v timeout >/dev/null 2>&1; then
+    if ! timeout "$timeout_secs" bash -c "$script_content" 2>&1 | python3 "${AGENT_FACTORY_DIR}/log_prefix.py" >> "$log_file"; then
+      exit_code=$?
+    fi
+  else
+    if ! bash -c "$script_content" 2>&1 | python3 "${AGENT_FACTORY_DIR}/log_prefix.py" >> "$log_file"; then
+      exit_code=$?
+    fi
+  fi
+
+  if [[ "$exit_code" == "124" ]]; then
+    set_spawn_status "timeout" "4" "$log_file"
+    return 4
+  fi
+  if [[ "$exit_code" != "0" ]]; then
+    set_spawn_status "execution_failure" "1" "$log_file"
+    return 1
+  fi
+  set_spawn_status "" "0" "$log_file"
+  return 0
+}
+
+execute_task() {
+  local task_file="$1"
+  local prompt_file="$2"
+  local log_label="$3"
+  local model_info_file="$4"
+  local mode
+  mode="$(get_execution_mode "$task_file")"
+  local original_dry_run="$dry_run"
+  case "$mode" in
+    direct_bash)
+      execute_task_direct_bash "$task_file" "$log_label"
+      ;;
+    dry_run)
+      dry_run="1"
+      execute_task_agent_cli "$prompt_file" "$log_label" "$model_info_file"
+      ;;
+    agent_cli|"")
+      execute_task_agent_cli "$prompt_file" "$log_label" "$model_info_file"
+      ;;
+    *)
+      log_ts "unknown execution mode '${mode}' in $task_file; defaulting to agent_cli"
+      execute_task_agent_cli "$prompt_file" "$log_label" "$model_info_file"
+      ;;
+  esac
+  dry_run="$original_dry_run"
+}
+
 consume_queue() {
   local processed_dir="${queue_dir%/}/processed"
   local queue_name
@@ -1418,6 +1771,12 @@ consume_queue() {
   local max_subplanner_pending="${MAX_SUBPLANNER_PENDING}"
   local last_rotation_check="$(date +%s)"
   local rotation_check_interval="${LOG_ROTATION_CHECK_INTERVAL_SECS}"
+  local queue_sleep="$sleep_secs"
+  case "$queue_name" in
+    queue) queue_sleep="${QUEUE_WORKER_SLEEP_SECS:-$sleep_secs}" ;;
+    subplanner_queue) queue_sleep="${QUEUE_SUBPLANNER_SLEEP_SECS:-$sleep_secs}" ;;
+    planner_queue) queue_sleep="${QUEUE_PLANNER_SLEEP_SECS:-$sleep_secs}" ;;
+  esac
   while [[ "$shutdown_requested" == "0" ]]; do
     local spawned="0"
     local task_file
@@ -1425,6 +1784,10 @@ consume_queue() {
 
     if [[ "$shutdown_requested" == "1" ]]; then
       break
+    fi
+
+    if [[ "$queue_name" == "queue" ]]; then
+      replenish_queue "$queue_dir" "$MIN_QUEUE_SIZE" "$SEED_TASKS_DIR" "$SEED_SHUFFLE"
     fi
 
     # pause worker/subplanner when judge has pending work
@@ -1436,7 +1799,7 @@ consume_queue() {
           if [[ "$shutdown_requested" == "1" ]]; then
             break
           fi
-          sleep "$sleep_secs"
+          sleep "$queue_sleep"
           continue
         fi
       fi
@@ -1449,7 +1812,7 @@ consume_queue() {
         if [[ "$shutdown_requested" == "1" ]]; then
           break
         fi
-        sleep "$sleep_secs"
+        sleep "$queue_sleep"
         continue
       fi
     fi
@@ -1461,13 +1824,18 @@ consume_queue() {
         if [[ "$shutdown_requested" == "1" ]]; then
           break
         fi
-        sleep "$sleep_secs"
+        sleep "$queue_sleep"
         continue
       fi
     fi
 
-    for task_file in $(find "$queue_dir" -maxdepth 1 -type f -name '*.md' | sort); do
+    while true; do
       if [[ "$shutdown_requested" == "1" ]]; then
+        break
+      fi
+
+      task_file="$(get_next_task "$queue_dir")"
+      if [[ -z "$task_file" ]]; then
         break
       fi
 
@@ -1489,6 +1857,93 @@ consume_queue() {
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
         current_claimed_file=""
         break
+      fi
+
+      # blocker handling (00_BLOCKER*.md, BLOCKER_* categories)
+      if [[ "$base_name" == 00_BLOCKER* ]] || [[ "$base_name" == BLOCKER_* ]]; then
+        if [[ "$base_name" == BLOCKER_HARD_* ]]; then
+          log_ts "hard blocker detected, halting: $base_name"
+          mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+          current_claimed_file=""
+          sleep "$queue_sleep"
+          continue
+        fi
+        case "${BLOCKER_MODE:-stop}" in
+          stop)
+            log_ts "blocker detected, halting: $base_name"
+            mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+            current_claimed_file=""
+            sleep "$queue_sleep"
+            continue
+            ;;
+          skip)
+            log_ts "blocker detected, skipping: $base_name"
+            mv "$claimed_file" "${processed_dir}/${base_name}.skipped" 2>/dev/null || true
+            current_claimed_file=""
+            spawned=$((spawned + 1))
+            if [[ "$spawned" -ge "$max_spawns" ]]; then
+              break
+            fi
+            continue
+            ;;
+          retry)
+            local blocker_state_dir
+            blocker_state_dir="${AGENT_FACTORY_STATE_DIR}/blocker_retries"
+            mkdir -p "$blocker_state_dir"
+            local blocker_state_file="${blocker_state_dir}/${base_name}.json"
+            local now_epoch
+            now_epoch="$(date +%s)"
+            local last_attempt=0
+            local attempt_count=0
+            if [[ -f "$blocker_state_file" ]]; then
+              last_attempt="$(python3 -c "import json; import sys; data=json.load(open('$blocker_state_file')); print(data.get('last_attempt', 0))" 2>/dev/null || echo "0")"
+              attempt_count="$(python3 -c "import json; import sys; data=json.load(open('$blocker_state_file')); print(data.get('attempt_count', 0))" 2>/dev/null || echo "0")"
+            fi
+
+            if [[ "$attempt_count" -ge "${BLOCKER_MAX_RETRIES}" ]]; then
+              log_ts "blocker max retries exceeded, skipping: $base_name"
+              mv "$claimed_file" "${processed_dir}/${base_name}.skipped" 2>/dev/null || true
+              current_claimed_file=""
+              spawned=$((spawned + 1))
+              if [[ "$spawned" -ge "$max_spawns" ]]; then
+                break
+              fi
+              continue
+            fi
+
+            local next_allowed=$((last_attempt + BLOCKER_RETRY_DELAY_SECS))
+            if [[ "$now_epoch" -lt "$next_allowed" ]]; then
+              log_ts "blocker retry delay active, requeueing: $base_name"
+              mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+              current_claimed_file=""
+              sleep "$queue_sleep"
+              continue
+            fi
+
+            attempt_count=$((attempt_count + 1))
+            python3 - <<'PY' "$blocker_state_file" "$now_epoch" "$attempt_count" 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = {"last_attempt": int(sys.argv[2]), "attempt_count": int(sys.argv[3])}
+path.write_text(json.dumps(payload))
+PY
+            log_ts "blocker retry attempt ${attempt_count}/${BLOCKER_MAX_RETRIES}: $base_name"
+            mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+            current_claimed_file=""
+            sleep "$BLOCKER_RETRY_DELAY_SECS"
+            continue
+            ;;
+          *)
+            log_ts "unknown BLOCKER_MODE '${BLOCKER_MODE}', defaulting to stop"
+            mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
+            current_claimed_file=""
+            sleep "$sleep_secs"
+            continue
+            ;;
+        esac
       fi
 
       # provenance snapshot (best-effort; requires git)
@@ -1523,16 +1978,18 @@ consume_queue() {
         requeue_attempt="$(python3 -c "import json, sys; d=json.load(open('$existing_prov')); print(d.get('requeue_attempt', 0) + 1)" 2>/dev/null || echo "1")"
       fi
       
+      local substituted_task
+      substituted_task="$(substitute_credentials "$claimed_file")"
       local tmp_prompt
       tmp_prompt="$(mktemp)"
       local spawn_result
       spawn_result=0
       
       # build prompt file with error handling
-      if ! cat "$profile" "$claimed_file" > "$tmp_prompt" 2>/dev/null; then
+      if ! cat "$profile" "$substituted_task" > "$tmp_prompt" 2>/dev/null; then
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: failed to build prompt file for $base_name" >&2
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
-        rm -f "$tmp_prompt" "$model_info_file" || true
+        rm -f "$substituted_task" "$tmp_prompt" "$model_info_file" || true
         current_claimed_file=""
         continue
       fi
@@ -1541,7 +1998,7 @@ consume_queue() {
       if [[ ! -f "$tmp_prompt" ]] || [[ ! -s "$tmp_prompt" ]]; then
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: prompt file is empty or missing for $base_name" >&2
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
-        rm -f "$tmp_prompt" "$model_info_file" || true
+        rm -f "$substituted_task" "$tmp_prompt" "$model_info_file" || true
         current_claimed_file=""
         continue
       fi
@@ -1579,17 +2036,17 @@ consume_queue() {
         # catch all error conditions: ERR, EXIT, INT, TERM
         trap 'local code=$?; echo "$code" > "$spawn_exit_file" 2>/dev/null || echo "1" > "$spawn_exit_file"; exit "$code"' ERR EXIT
         trap 'echo "130" > "$spawn_exit_file" 2>/dev/null || true; exit 130' INT TERM
-        # run spawn_with_file with explicit error handling
+        # run execute_task with explicit error handling
         # capture both exit code and any errors
         # isolate errors to prevent orchestrator crash
         local spawn_exit=1
         base_label="${base_name%.md}"
-        if spawn_with_file "$tmp_prompt" "${queue_name}_${base_label}" "$model_info_file" 2>"$spawn_stderr"; then
+        if execute_task "$substituted_task" "$tmp_prompt" "${queue_name}_${base_label}" "$model_info_file" 2>"$spawn_stderr"; then
           spawn_exit=0
         else
           spawn_exit=$?
           # log error for debugging (non-fatal, loop continues)
-          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) spawn_with_file returned exit code: $spawn_exit" >&2
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) execute_task returned exit code: $spawn_exit" >&2
         fi
         # ensure exit code is written even if trap doesn't fire
         echo "$spawn_exit" > "$spawn_exit_file" 2>/dev/null || echo "1" > "$spawn_exit_file"
@@ -2019,6 +2476,9 @@ PY
       then
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) WARNING: failed to create provenance for $base_name" >&2
       fi
+
+      local task_rate_limit
+      task_rate_limit="$(get_task_rate_limit "$claimed_file")"
       
       case $spawn_result in
         0)
@@ -2028,45 +2488,51 @@ PY
           # empty output: requeue for retry
           mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
           echo "empty output detected; requeueing: $base_name" >&2
-          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" "$substituted_task" || true
           current_claimed_file=""
+          sleep_for_rate_limit "$task_rate_limit"
           continue
           ;;
         3)
           # NEED-INFO: requeue for later (after info is provided)
           mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
           echo "NEED-INFO response; requeueing: $base_name" >&2
-          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" "$substituted_task" || true
           current_claimed_file=""
+          sleep_for_rate_limit "$task_rate_limit"
           continue
           ;;
         4)
           # timeout: requeue for retry
           mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
           echo "execution timeout; requeueing: $base_name" >&2
-          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" "$substituted_task" || true
           current_claimed_file=""
+          sleep_for_rate_limit "$task_rate_limit"
           continue
           ;;
         *)
           # other errors (rate limit, execution failure): requeue for retry
           mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
           echo "failed to process (error code $spawn_result); requeueing: $base_name" >&2
-          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+          rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" "$substituted_task" || true
           current_claimed_file=""
+          sleep_for_rate_limit "$task_rate_limit"
           continue
           ;;
       esac
 
+      sleep_for_rate_limit "$task_rate_limit"
+
       # if shutdown was requested, exit gracefully (successful tasks are not requeued)
       if [[ "$shutdown_requested" == "1" ]]; then
         echo "shutdown requested after task completion; exiting gracefully" >&2
-        rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+        rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" "$substituted_task" || true
         current_claimed_file=""
         break
       fi
 
-      rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" || true
+      rm -f "$before_list" "$after_list" "$tmp_prompt" "$model_info_file" "$substituted_task" || true
       current_claimed_file=""
       spawned=$((spawned + 1))
       if [[ "$spawned" -ge "$max_spawns" ]]; then
@@ -2093,7 +2559,7 @@ PY
       last_rotation_check="$now_epoch"
     fi
     
-    sleep "$sleep_secs"
+    sleep "$queue_sleep"
   done
 
   if [[ -n "$current_claimed_file" && -f "$current_claimed_file" ]]; then

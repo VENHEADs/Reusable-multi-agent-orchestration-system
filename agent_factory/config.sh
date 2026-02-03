@@ -112,6 +112,13 @@ DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-5.2}"
 # fallback model name if rate limit hit
 FALLBACK_MODEL="${FALLBACK_MODEL:-gpt-4o-mini}"
 
+# model fallback chain (comma-separated, used when MODEL_CHAIN is non-empty)
+# leave empty to preserve single-model + fallback behavior
+MODEL_CHAIN="${MODEL_CHAIN:-}"
+
+# backoff between model chain attempts when rate limits are detected (seconds)
+MODEL_RATE_LIMIT_BACKOFF_SECS="${MODEL_RATE_LIMIT_BACKOFF_SECS:-60}"
+
 # max retries for agent execution
 ORCHESTRATOR_MAX_RETRIES="${ORCHESTRATOR_MAX_RETRIES:-3}"
 
@@ -128,6 +135,70 @@ AGENT_EXECUTION_TIMEOUT_SECS="${AGENT_EXECUTION_TIMEOUT_SECS:-1800}"
 
 # graceful shutdown timeout (seconds) - processes will force exit after this time
 SHUTDOWN_TIMEOUT_SECS="${SHUTDOWN_TIMEOUT_SECS:-60}"
+
+# ============================================================================
+# task execution modes
+# ============================================================================
+
+# default task execution mode when no task header is present
+DEFAULT_EXECUTION_MODE="${DEFAULT_EXECUTION_MODE:-agent_cli}"
+
+# timeout for direct_bash execution (seconds)
+DIRECT_BASH_TIMEOUT_SECS="${DIRECT_BASH_TIMEOUT_SECS:-60}"
+
+# ============================================================================
+# queue replenishment
+# ============================================================================
+
+# seed tasks directory for auto-replenishment
+SEED_TASKS_DIR="${SEED_TASKS_DIR:-analysis/seed_tasks}"
+
+# minimum queue size before replenishment occurs
+MIN_QUEUE_SIZE="${MIN_QUEUE_SIZE:-5}"
+
+# randomize seed task order when copying (1=enabled, 0=disabled)
+SEED_SHUFFLE="${SEED_SHUFFLE:-1}"
+
+# ============================================================================
+# blocker handling
+# ============================================================================
+
+# blocker handling mode: stop|skip|retry
+BLOCKER_MODE="${BLOCKER_MODE:-stop}"
+
+# maximum blocker age in hours before auto-skip (for watchdog cleanup)
+BLOCKER_MAX_AGE_HOURS="${BLOCKER_MAX_AGE_HOURS:-1}"
+
+# delay between blocker retries (seconds)
+BLOCKER_RETRY_DELAY_SECS="${BLOCKER_RETRY_DELAY_SECS:-300}"
+
+# maximum blocker retries before skipping
+BLOCKER_MAX_RETRIES="${BLOCKER_MAX_RETRIES:-3}"
+
+# ============================================================================
+# watchdog configuration
+# ============================================================================
+
+# watchdog check interval (seconds)
+WATCHDOG_CHECK_INTERVAL_SECS="${WATCHDOG_CHECK_INTERVAL_SECS:-900}"
+
+# max idle minutes before watchdog restarts factory
+WATCHDOG_MAX_IDLE_MINUTES="${WATCHDOG_MAX_IDLE_MINUTES:-45}"
+
+# auto-replenish queue from seed tasks (1=enabled, 0=disabled)
+WATCHDOG_AUTO_REPLENISH="${WATCHDOG_AUTO_REPLENISH:-1}"
+
+# minimum queue size before watchdog replenishes
+WATCHDOG_MIN_QUEUE_SIZE="${WATCHDOG_MIN_QUEUE_SIZE:-5}"
+
+# ============================================================================
+# per-queue rate limits
+# ============================================================================
+
+# per-queue sleep overrides (seconds)
+QUEUE_WORKER_SLEEP_SECS="${QUEUE_WORKER_SLEEP_SECS:-1800}"
+QUEUE_SUBPLANNER_SLEEP_SECS="${QUEUE_SUBPLANNER_SLEEP_SECS:-300}"
+QUEUE_PLANNER_SLEEP_SECS="${QUEUE_PLANNER_SLEEP_SECS:-600}"
 
 # ============================================================================
 # judge daemon configuration

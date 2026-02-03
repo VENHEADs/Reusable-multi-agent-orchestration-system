@@ -195,7 +195,46 @@ cat >"$plist_path" <<EOF
 </plist>
 EOF
 
-for role in primary_planner sub_planner worker judge judge_trigger; do
+# watchdog job (periodic checks, StartInterval only)
+label="com.${project_id}.agent_factory.watchdog"
+plist_path="${launch_agents_dir}/${label}.plist"
+cat >"$plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>-lc</string>
+      <string>cd "${repo_root}"; exec "${repo_root}/agent_factory/watchdog.sh"</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${repo_root}</string>
+    <key>StartInterval</key>
+    <integer>${WATCHDOG_CHECK_INTERVAL_SECS}</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${repo_root}/logs/watchdog.launchd_stdout</string>
+    <key>StandardErrorPath</key>
+    <string>${repo_root}/logs/watchdog.launchd_stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>HOME</key>
+      <string>${HOME}</string>
+      <key>USER</key>
+      <string>${USER}</string>
+      <key>PATH</key>
+      <string>${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+  </dict>
+</plist>
+EOF
+
+for role in primary_planner sub_planner worker judge judge_trigger watchdog; do
   label="com.${project_id}.agent_factory.${role}"
   plist_path="${launch_agents_dir}/${label}.plist"
 
