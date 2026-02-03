@@ -113,8 +113,8 @@ DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-5.2}"
 FALLBACK_MODEL="${FALLBACK_MODEL:-gpt-4o-mini}"
 
 # model fallback chain (comma-separated, used when MODEL_CHAIN is non-empty)
-# leave empty to preserve single-model + fallback behavior
-MODEL_CHAIN="${MODEL_CHAIN:-}"
+# set default chain to use multiple providers when rate limited
+MODEL_CHAIN="${MODEL_CHAIN:-gpt-5.2,gemini-3-flash,auto}"
 
 # backoff between model chain attempts when rate limits are detected (seconds)
 MODEL_RATE_LIMIT_BACKOFF_SECS="${MODEL_RATE_LIMIT_BACKOFF_SECS:-60}"
@@ -164,7 +164,7 @@ SEED_SHUFFLE="${SEED_SHUFFLE:-1}"
 # ============================================================================
 
 # blocker handling mode: stop|skip|retry
-BLOCKER_MODE="${BLOCKER_MODE:-stop}"
+BLOCKER_MODE="${BLOCKER_MODE:-skip}"
 
 # maximum blocker age in hours before auto-skip (for watchdog cleanup)
 BLOCKER_MAX_AGE_HOURS="${BLOCKER_MAX_AGE_HOURS:-1}"
