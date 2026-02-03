@@ -371,10 +371,14 @@ Or use launchd jobs (see "Scheduling" below).
 
 - **`agent_factory/orchestrator`**: Core script that spawns agents and manages queues
 - **`agent_factory/run_orchestrator`**: Wrapper that handles API key from macOS Keychain
+- **`agent_factory/watchdog.sh`**: Periodic watchdog that detects idle/stuck factories and restarts
+- **`agent_factory/health_check.sh`**: JSON health report for remote monitoring
+- **`agent_factory/launchd_reset.sh`**: Resets launchd jobs when bootstrap gets stuck
 - **`Agent_profiles/`**: Markdown files defining agent behavior (created from templates)
 - **`agent_factory/Agent_profiles/`**: Template profiles for the 4-agent system
 - **`agent_factory/goal_template.md`**: Template for goal file (source of truth)
 - **`agent_factory/launchd/`**: macOS launchd job templates for scheduling
+- **`agent_factory/plists/`**: Additional launchd plist templates (e.g., watchdog)
 
 ### Goal File (Source of Truth)
 
@@ -400,6 +404,7 @@ The goal file is checked on every agent invocation, so changes take effect immed
 - **`tasks/queue/`**: Worker tasks (`.md` files, from Sub-Planner)
 - **`tasks/queue/processed/`**: Completed worker tasks (moved atomically)
 - **`tasks/judge_queue/`**: Judge triggers (auto-created by `judge_trigger` when pipeline is idle)
+- **`analysis/seed_tasks/`**: Optional seed tasks for auto-replenishment
 
 ### Commit Workflow
 
@@ -535,6 +540,8 @@ Additionally, a deterministic (non-ai) launchd job `judge_trigger` runs continuo
 - git has uncommitted changes, and
 - `tasks/planner_queue/`, `tasks/subplanner_queue/`, and `tasks/queue/` are empty.
 
+The launchd bundle also includes a **watchdog** job that runs on a `StartInterval` schedule to detect idle/stuck factories and auto-restart when needed.
+
 ### Daemon Mode (Continuous)
 
 Use `template_daemon.plist` for workers that should run continuously:
@@ -667,7 +674,25 @@ Configuration values are resolved in this order (highest to lowest priority):
 - `AGENT_EXECUTION_TIMEOUT_SECS`: agent execution timeout in seconds (default: 1800 = 30 minutes)
 - `SHUTDOWN_TIMEOUT_SECS`: graceful shutdown timeout in seconds (default: 60)
 - `DEFAULT_MODEL`: default model name passed to agents (default: `gpt-5.2`)
-- `FALLBACK_MODEL`: fallback model name if rate limit hit (default: `gpt-5.2-codex-low`)
+- `FALLBACK_MODEL`: fallback model name if rate limit hit (default: `gpt-4o-mini`)
+- `MODEL_CHAIN`: comma-separated model chain (empty by default; when set, retries move to next model)
+- `MODEL_RATE_LIMIT_BACKOFF_SECS`: backoff between model chain attempts (default: 60)
+- `DEFAULT_EXECUTION_MODE`: default execution mode for tasks (default: `agent_cli`)
+- `DIRECT_BASH_TIMEOUT_SECS`: timeout for `direct_bash` tasks (default: 60)
+- `BLOCKER_MODE`: blocker handling mode (`stop|skip|retry`, default: `stop`)
+- `BLOCKER_MAX_AGE_HOURS`: max blocker age before auto-skip (default: 1)
+- `BLOCKER_RETRY_DELAY_SECS`: delay between blocker retries (default: 300)
+- `BLOCKER_MAX_RETRIES`: max blocker retries before skip (default: 3)
+- `SEED_TASKS_DIR`: seed tasks directory for auto-replenishment (default: `analysis/seed_tasks`)
+- `MIN_QUEUE_SIZE`: minimum queue size before replenishment (default: 5)
+- `SEED_SHUFFLE`: shuffle seed tasks when replenishing (default: 1)
+- `WATCHDOG_CHECK_INTERVAL_SECS`: watchdog interval seconds (default: 900)
+- `WATCHDOG_MAX_IDLE_MINUTES`: idle threshold for watchdog restart (default: 45)
+- `WATCHDOG_AUTO_REPLENISH`: enable watchdog replenishment (default: 1)
+- `WATCHDOG_MIN_QUEUE_SIZE`: queue size threshold for watchdog replenishment (default: 5)
+- `QUEUE_WORKER_SLEEP_SECS`: per-queue sleep for worker queue (default: 1800)
+- `QUEUE_SUBPLANNER_SLEEP_SECS`: per-queue sleep for subplanner queue (default: 300)
+- `QUEUE_PLANNER_SLEEP_SECS`: per-queue sleep for planner queue (default: 600)
 
 **Judge Daemon:**
 - `JUDGE_SLEEP_SECS`: sleep between judge queue checks (default: 15)
@@ -765,6 +790,7 @@ Rate limit detection checks for:
 - "ActionRequiredError"
 
 If a rate limit is detected, the orchestrator automatically retries with the fallback model and logs both attempts.
+If `MODEL_CHAIN` is configured, rate limits will advance through the chain with a backoff between models.
 
 ## Task Format
 
@@ -816,6 +842,32 @@ Create a POST /api/auth/login endpoint that validates user credentials and retur
 - No mocks - use real database connection
 - Comments start with lowercase
 ```
+
+### Task Headers (Execution, Rate Limits, Priority)
+
+You can control execution mode, per-task rate limits, and priority via headers:
+
+```markdown
+# Task: Post to Moltbook
+# execution: direct_bash
+# rate_limit: 20
+# priority: critical
+
+```bash
+curl -X POST "https://api.example.com/posts" \
+  -H "Authorization: Bearer ${MOLTBOOK_API_KEY}"
+```
+```
+
+- **`# execution:`**: `agent_cli` (default), `direct_bash`, or `dry_run`.
+- **`# rate_limit:`**: Sleep time (seconds) applied after this task completes.
+- **`# priority:`**: `critical`, `high`, `normal`, `low` (defaults to filename prefix).
+
+### Credentials Substitution
+
+Store credentials in `~/.config/agent_factory/credentials.json` and optionally override per project in
+`credentials/secrets.json` (gitignored). Tasks can reference variables using `${VAR}` and they will be
+expanded at runtime.
 
 ### Judge Tasks
 
