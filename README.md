@@ -867,7 +867,15 @@ curl -X POST "https://api.example.com/posts" \
 
 Store credentials in `~/.config/agent_factory/credentials.json` and optionally override per project in
 `credentials/secrets.json` (gitignored). Tasks can reference variables using `${VAR}` and they will be
-expanded at runtime.
+expanded at runtime. By default, credential substitution runs in **allowlist** mode, so only variables
+listed in `CREDENTIALS_ALLOWLIST` are expanded. To opt into legacy behavior (expand everything), set
+`CREDENTIALS_SUBSTITUTION_MODE=all`. For example:
+
+```bash
+export CREDENTIALS_ALLOWLIST="MY_API_KEY,MY_TOKEN"
+# or to allow all substitutions (less safe):
+export CREDENTIALS_SUBSTITUTION_MODE=all
+```
 
 ### Judge Tasks
 

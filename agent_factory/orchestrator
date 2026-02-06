@@ -234,10 +234,13 @@ substitute_credentials() {
   local input_file="$1"
   local tmp_file
   tmp_file="$(mktemp)"
-  if command -v envsubst >/dev/null 2>&1; then
-    envsubst < "$input_file" > "$tmp_file"
-  else
-    python3 - "$input_file" "$tmp_file" <<'PY' 2>/dev/null || cp "$input_file" "$tmp_file"
+  local substitution_mode="${CREDENTIALS_SUBSTITUTION_MODE:-allowlist}"
+  local allowlist="${CREDENTIALS_ALLOWLIST:-}"
+  if [[ "$substitution_mode" == "all" ]]; then
+    if command -v envsubst >/dev/null 2>&1; then
+      envsubst < "$input_file" > "$tmp_file"
+    else
+      python3 - "$input_file" "$tmp_file" <<'PY' 2>/dev/null || cp "$input_file" "$tmp_file"
 import os
 import re
 import sys
@@ -250,6 +253,34 @@ content = source_path.read_text(errors="replace")
 def replacer(match):
     key = match.group(1)
     return os.environ.get(key, match.group(0))
+
+content = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", replacer, content)
+dest_path.write_text(content)
+PY
+    fi
+  else
+    ALLOWLIST="$allowlist" python3 - "$input_file" "$tmp_file" <<'PY' 2>/dev/null || cp "$input_file" "$tmp_file"
+import os
+import re
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1])
+dest_path = Path(sys.argv[2])
+content = source_path.read_text(errors="replace")
+allowlist = os.environ.get("ALLOWLIST", "")
+
+allowed = set()
+if allowlist.strip():
+    for raw in re.split(r"[,\s]+", allowlist.strip()):
+        if raw:
+            allowed.add(raw)
+
+def replacer(match):
+    key = match.group(1)
+    if key in allowed and key in os.environ:
+        return os.environ.get(key, match.group(0))
+    return match.group(0)
 
 content = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", replacer, content)
 dest_path.write_text(content)
@@ -2018,10 +2049,17 @@ PY
       local spawn_exit_file
       spawn_exit_file="$(mktemp)"
       spawn_result=1
+      cleanup_spawn_artifacts() {
+        rm -f "${spawn_stderr:-}" "${spawn_exit_file:-}" 2>/dev/null || true
+      }
+      disable_spawn_cleanup_trap() {
+        cleanup_spawn_files=0
+        trap - EXIT
+      }
       
       # ensure cleanup on exit (even if script is interrupted)
       local cleanup_spawn_files=1
-      trap 'if [[ "${cleanup_spawn_files:-0}" == "1" ]]; then rm -f "${spawn_stderr:-}" "${spawn_exit_file:-}" 2>/dev/null || true; fi' EXIT
+      trap 'if [[ "${cleanup_spawn_files:-0}" == "1" ]]; then cleanup_spawn_artifacts; fi' EXIT
       
       # run spawn in background with timeout protection to prevent hang
       # use explicit timeout to prevent orchestrator from hanging indefinitely
@@ -2059,7 +2097,8 @@ PY
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: invalid spawn_pid, spawn process may have failed to start: $base_name" >&2
         spawn_result=1
         echo "1" > "$spawn_exit_file" 2>/dev/null || true
-        rm -f "$spawn_stderr" || true
+        cleanup_spawn_artifacts
+        disable_spawn_cleanup_trap
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
         current_claimed_file=""
         continue
@@ -2108,7 +2147,8 @@ PY
           spawn_result=1
         fi
         echo "$spawn_result" > "$spawn_exit_file" 2>/dev/null || true
-        rm -f "$spawn_stderr" || true
+        cleanup_spawn_artifacts
+        disable_spawn_cleanup_trap
         mv "$claimed_file" "$queue_dir/$base_name" 2>/dev/null || true
         current_claimed_file=""
         continue
