@@ -106,6 +106,19 @@ CURSOR_API_KEY="${CURSOR_API_KEY:-}"
 # antigravity API key (default: from $ANTIGRAVITY_API_KEY)
 ANTIGRAVITY_API_KEY="${ANTIGRAVITY_API_KEY:-}"
 
+# ============================================================================
+# credential substitution
+# ============================================================================
+
+# credential substitution mode: allowlist|all
+# - allowlist: only substitute variables listed in CREDENTIALS_ALLOWLIST
+# - all: substitute any ${VAR} found in task files (legacy behavior)
+CREDENTIALS_SUBSTITUTION_MODE="${CREDENTIALS_SUBSTITUTION_MODE:-allowlist}"
+
+# comma- or space-separated list of variables allowed for substitution when
+# CREDENTIALS_SUBSTITUTION_MODE=allowlist (e.g., "MY_API_KEY,MY_TOKEN")
+CREDENTIALS_ALLOWLIST="${CREDENTIALS_ALLOWLIST:-}"
+
 # default model name passed to agent CLI (override via --model or DEFAULT_MODEL)
 DEFAULT_MODEL="${DEFAULT_MODEL:-gpt-5.2}"
 
